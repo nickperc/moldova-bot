@@ -412,55 +412,78 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Крипто ──────────────────────────────────────────────────────────────────
 
+def _fmt_price(price: float) -> str:
+    """Форматирует цену монеты в читаемый вид."""
+    if price >= 1_000:
+        return f"${price:,.0f}"
+    elif price >= 1:
+        return f"${price:,.2f}"
+    elif price >= 0.01:
+        return f"${price:.4f}"
+    else:
+        return f"${price:.6f}"
+
+
+def _fmt_mcap(mcap: float) -> str:
+    """Форматирует капитализацию: T / B / M."""
+    if mcap >= 1_000_000_000_000:
+        return f"${mcap / 1_000_000_000_000:.2f}T"
+    elif mcap >= 1_000_000_000:
+        return f"${mcap / 1_000_000_000:.1f}B"
+    else:
+        return f"${mcap / 1_000_000:.0f}M"
+
+
+def _fmt_change(change: float) -> str:
+    """Форматирует % изменение с нужным emoji и знаком."""
+    if change is None:
+        return "➡️  0.0%"
+    elif abs(change) < 0.05:          # практически ноль
+        return f"➡️  0.0%"
+    elif change > 0:
+        return f"📈 +{change:.1f}%"
+    else:
+        return f"📉 {change:.1f}%"
+
+
 async def crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Топ-10 криптовалют по капитализации через CoinGecko (бесплатный API)."""
+    """Топ-10 криптовалют по капитализации через CoinGecko."""
     url = (
         "https://api.coingecko.com/api/v3/coins/markets"
         "?vs_currency=usd&order=market_cap_desc&per_page=10&page=1"
         "&sparkline=false&price_change_percentage=24h"
     )
+    HEADERS = {"User-Agent": "MoldovaBot/1.0"}
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     raise ValueError(f"HTTP {resp.status}")
                 coins = await resp.json()
 
-        rows = ""
+        # Собираем строки таблицы в моноширинном блоке для выравнивания
+        lines = []
         for i, c in enumerate(coins, 1):
-            name      = c["name"]
             symbol    = c["symbol"].upper()
-            price     = c["current_price"]
-            change    = c.get("price_change_percentage_24h") or 0.0
-            mcap      = c["market_cap"]
-            arrow     = "🟢" if change >= 0 else "🔴"
-            sign      = "+" if change >= 0 else ""
+            price     = c.get("current_price") or 0.0
+            change    = c.get("price_change_percentage_24h")
+            mcap      = c.get("market_cap") or 0
 
-            # Форматируем цену красиво
-            if price >= 1:
-                price_str = f"${price:,.2f}"
-            elif price >= 0.01:
-                price_str = f"${price:.4f}"
-            else:
-                price_str = f"${price:.8f}"
+            price_str  = _fmt_price(price).ljust(12)
+            change_str = _fmt_change(change).ljust(14)
+            mcap_str   = _fmt_mcap(mcap)
 
-            # Форматируем капу: $1.23T / $456.7B / $12.3M
-            if mcap >= 1_000_000_000_000:
-                mcap_str = f"${mcap/1_000_000_000_000:.2f}T"
-            elif mcap >= 1_000_000_000:
-                mcap_str = f"${mcap/1_000_000_000:.1f}B"
-            else:
-                mcap_str = f"${mcap/1_000_000:.0f}M"
+            lines.append(f"{i:>2}. {symbol:<6} {price_str} {change_str} {mcap_str}")
 
-            rows += (
-                f"{i}. {arrow} <b>{name}</b> ({symbol})\n"
-                f"   💵 {price_str}  {sign}{change:.1f}%  🏦 {mcap_str}\n"
-            )
+        table = "\n".join(lines)
 
         msg = (
-            "💎 <b>Топ-10 криптовалют</b>\n"
-            "<i>Цена · Изменение за 24ч · Капитализация</i>\n\n"
-            f"{rows}\n"
+            "💎 <b>Топ-10 криптовалют</b>\n\n"
+            "<code>"
+            " #  Монета  Цена           24ч             Капа\n"
+            "─────────────────────────────────────────────\n"
+            f"{table}"
+            "</code>\n\n"
             "<i>Источник: CoinGecko</i>"
         )
     except Exception as e:
@@ -471,96 +494,58 @@ async def crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def alt_season(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Индекс альтсезона.
-    Логика: берём топ-50 монет (без BTC и стейблов), считаем сколько из них
-    обогнали BTC за последние 90 дней. Если ≥75% — альтсезон. Официальная
-    методология сайта blockchaincenter.net.
-    """
-    url_top50 = (
-        "https://api.coingecko.com/api/v3/coins/markets"
-        "?vs_currency=usd&order=market_cap_desc&per_page=50&page=1"
-        "&sparkline=false&price_change_percentage=90d"
-    )
-    url_btc = (
-        "https://api.coingecko.com/api/v3/simple/price"
-        "?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
-    )
-
-    STABLECOINS = {"usdt", "usdc", "busd", "dai", "tusd", "usdp", "usdd",
-                   "frax", "lusd", "gusd", "fdusd", "pyusd"}
-
+    """Индекс альтсезона на основе доминации BTC. altseasonIndex = 100 - btc_dominance."""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url_top50, timeout=aiohttp.ClientTimeout(total=12)) as r1:
-                if r1.status != 200:
-                    raise ValueError(f"HTTP {r1.status}")
-                top50 = await r1.json()
+            async with session.get(
+                "https://api.coingecko.com/api/v3/global",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                data = await resp.json()
 
-            async with session.get(url_btc, timeout=aiohttp.ClientTimeout(total=8)) as r2:
-                if r2.status != 200:
-                    raise ValueError(f"HTTP {r2.status}")
-                btc_data = await r2.json()
+        btc_dominance = data["data"]["market_cap_percentage"]["btc"]
+        index = round(100 - btc_dominance)
+        index = max(0, min(100, index))  # зажимаем в [0, 100]
 
-        # Изменение BTC за 90 дней — ищем в списке топ50
-        btc_90d = next(
-            (c.get("price_change_percentage_90d_in_currency") or 0.0
-             for c in top50 if c["symbol"].lower() == "btc"),
-            0.0
-        )
-
-        # Фильтруем: убираем BTC и стейблы
-        alts = [
-            c for c in top50
-            if c["symbol"].lower() != "btc"
-            and c["symbol"].lower() not in STABLECOINS
-        ]
-
-        # Считаем сколько алтов обогнали BTC за 90 дней
-        total = len(alts)
-        outperformed = sum(
-            1 for c in alts
-            if (c.get("price_change_percentage_90d_in_currency") or 0.0) > btc_90d
-        )
-
-        index = round((outperformed / total) * 100) if total else 0
-
-        # Определяем статус
-        if index >= 75:
+        # ── Статус ───────────────────────────────────────────────────────────
+        if btc_dominance < 40:
             status      = "🚀 <b>АЛЬТСЕЗОН!</b>"
-            description = "Альты рвут! Более 75% топ-50 монет обогнали Bitcoin за 90 дней."
-            verdict     = "🔥 Альтсезон в разгаре — исторически лучшее время для алтов!"
-        elif index >= 55:
+            description = "BTC доминация ниже 40% — альты правят рынком!"
+            verdict     = "🔥 Исторически лучшее время для альткоинов!"
+        elif btc_dominance < 50:
             status      = "⚡ <b>Начало альтсезона</b>"
-            description = "Альты набирают силу — больше половины обогнали BTC."
-            verdict     = "📈 Рынок разогревается. Следи за альтами внимательно."
-        elif index >= 40:
+            description = "BTC теряет долю рынка — альты набирают силу."
+            verdict     = "📈 Следи за альтами внимательно, рынок разогревается."
+        elif btc_dominance < 55:
             status      = "😐 <b>Нейтральный рынок</b>"
             description = "Нет явного доминирования ни BTC, ни альтов."
             verdict     = "🤷 Жди чёткого сигнала — пока рынок в равновесии."
-        elif index >= 25:
+        elif btc_dominance < 60:
             status      = "🟡 <b>Сезон Bitcoin</b>"
-            description = "BTC доминирует, большинство алтов отстают."
-            verdict     = "⚠️ Алты под давлением — осторожно с покупками."
+            description = "BTC доминирует, альты под давлением."
+            verdict     = "⚠️ Осторожно с покупкой альтов — BTC сильнее."
         else:
             status      = "🟠 <b>Глубокий сезон Bitcoin</b>"
-            description = "BTC сильно обгоняет альты. Альтсезон далеко."
+            description = "BTC значительно доминирует на рынке."
             verdict     = "🛑 Альты страдают. Лучше подождать разворота."
 
-        # Визуальная шкала
+        # ── Визуальная шкала ─────────────────────────────────────────────────
         filled = round(index / 10)
         bar    = "█" * filled + "░" * (10 - filled)
 
         msg = (
-            f"🌡️ <b>Индекс Альтсезона</b>\n\n"
+            "🌡️ <b>Индекс Альтсезона</b>\n\n"
             f"{status}\n"
             f"<code>[{bar}] {index}/100</code>\n\n"
-            f"📊 {outperformed} из {total} топ-алтов обогнали BTC за 90 дней\n"
-            f"₿  BTC за 90 дней: {'🟢 +' if btc_90d >= 0 else '🔴 '}{btc_90d:.1f}%\n\n"
+            f"📊 BTC доминация: <b>{btc_dominance:.2f}%</b>\n"
+            f"🔢 Формула: 100 - {btc_dominance:.2f}% = <b>{index}</b>\n\n"
             f"ℹ️ {description}\n\n"
             f"{verdict}\n\n"
-            "<i>Методология: blockchaincenter.net · Данные: CoinGecko</i>"
+            "<i>Данные: CoinGecko /global</i>"
         )
+
     except Exception as e:
         logger.warning(f"AltSeason error: {e}")
         msg = "⚠️ Не удалось получить данные. Попробуй позже!"
