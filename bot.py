@@ -2,6 +2,7 @@ import os
 import random
 import logging
 import aiohttp
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from telegram import Update, Poll
 from telegram.ext import (
@@ -172,6 +173,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "💎 <b>Крипто</b>\n"
         "/crypto — Топ-10 криптовалют 📈\n"
         "/altSeason — Индекс альтсезона 🚀\n\n"
+        "📰 <b>Новости</b>\n"
+        "/news — Мировые новости\n"
+        "/news md — 🇲🇩 Молдова\n"
+        "/news crypto — 💎 Крипто\n"
+        "/news tech — 💻 Технологии\n\n"
         "<i>Бот говорит только по-русски 🇷🇺</i>"
     )
     await update.message.reply_html(text)
@@ -602,6 +608,208 @@ async def keyword_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+# ─── Новости ──────────────────────────────────────────────────────────────────
+
+# RSS источники по категориям
+NEWS_SOURCES = {
+    "md": {
+        "label":   "🇲🇩 Новости Молдовы",
+        "sources": [
+            ("Point.md",    "https://point.md/rss"),
+            ("Noi.md",      "https://www.noi.md/rss"),
+            ("Moldova.org", "https://moldova.org/feed/"),
+        ],
+    },
+    "world": {
+        "label":   "🌍 Мировые новости",
+        "sources": [
+            ("BBC Русский",  "https://feeds.bbci.co.uk/russian/rss.xml"),
+            ("РИА Новости",  "https://rsshub.app/ria/news"),
+            ("Reuters",      "https://feeds.reuters.com/reuters/topNews"),
+        ],
+    },
+    "crypto": {
+        "label":   "💎 Крипто-новости",
+        "sources": [
+            ("CoinDesk",     "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+            ("CoinTelegraph","https://cointelegraph.com/rss"),
+            ("Decrypt",      "https://decrypt.co/feed"),
+        ],
+    },
+    "tech": {
+        "label":   "💻 Технологии",
+        "sources": [
+            ("TechCrunch",   "https://techcrunch.com/feed/"),
+            ("The Verge",    "https://www.theverge.com/rss/index.xml"),
+            ("Hacker News",  "https://hnrss.org/frontpage"),
+        ],
+    },
+}
+
+NEWS_HELP = (
+    "📰 Использование: /news [категория]\n\n"
+    "Доступные категории:\n"
+    "  /news md      — 🇲🇩 Молдова\n"
+    "  /news world   — 🌍 Мировые\n"
+    "  /news crypto  — 💎 Крипто\n"
+    "  /news tech    — 💻 Технологии\n\n"
+    "<i>По умолчанию: /news world</i>"
+)
+
+
+async def _fetch_rss(session: aiohttp.ClientSession, url: str, limit: int = 5) -> list[dict]:
+    """Парсит RSS-ленту и возвращает список {title, link, date}."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return []
+            raw = await resp.read()
+
+        root = ET.fromstring(raw)
+        # Поддержка RSS 2.0 и Atom
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        items = root.findall(".//item") or root.findall(".//atom:entry", ns)
+
+        results = []
+        for item in items[:limit]:
+            # Заголовок
+            title_el = item.find("title")
+            title = ""
+            if title_el is not None:
+                title = (title_el.text or "").strip()
+                # Убираем CDATA и лишние пробелы
+                title = title.replace("<![CDATA[", "").replace("]]>", "").strip()
+
+            # Ссылка
+            link_el = item.find("link")
+            link = ""
+            if link_el is not None:
+                link = (link_el.text or "").strip()
+            if not link:
+                # Atom-стиль: <link href="..."/>
+                link_el = item.find("atom:link", ns)
+                if link_el is not None:
+                    link = link_el.get("href", "")
+
+            if title and link:
+                results.append({"title": title, "link": link})
+
+        return results
+    except Exception as e:
+        logger.debug(f"RSS fetch error for {url}: {e}")
+        return []
+
+
+async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать последние новости по категории из RSS-лент."""
+    # Определяем категорию
+    cat = context.args[0].lower() if context.args else "world"
+
+    if cat in ("help", "?"):
+        await update.message.reply_html(NEWS_HELP)
+        return
+
+    if cat not in NEWS_SOURCES:
+        await update.message.reply_html(
+            f"❓ Неизвестная категория <b>{cat}</b>\n\n{NEWS_HELP}"
+        )
+        return
+
+    source_cfg = NEWS_SOURCES[cat]
+    await update.message.reply_text("🔄 Загружаю новости...")
+
+    articles = []
+    source_used = None
+
+    async with aiohttp.ClientSession() as session:
+        for name, url in source_cfg["sources"]:
+            items = await _fetch_rss(session, url, limit=5)
+            if items:
+                articles = items
+                source_used = name
+                break  # берём первый рабочий источник
+
+    if not articles:
+        await update.message.reply_text(
+            "⚠️ Не удалось загрузить новости. Все источники недоступны, попробуй позже."
+        )
+        return
+
+    # Форматируем вывод
+    lines = []
+    for i, art in enumerate(articles, 1):
+        title = art["title"]
+        # Обрезаем слишком длинные заголовки
+        if len(title) > 120:
+            title = title[:117] + "..."
+        lines.append(f"{i}. <a href=\"{art['link']}\">{title}</a>")
+
+    msg = (
+        f"{source_cfg['label']}\n"
+        f"<i>Источник: {source_used}</i>\n\n"
+        + "\n\n".join(lines)
+        + "\n\n<i>Нажми на заголовок чтобы открыть статью</i>"
+    )
+
+    await update.message.reply_html(
+        msg,
+        disable_web_page_preview=True,
+    )
+
+
+# ─── Логирование использования ────────────────────────────────────────────────
+
+async def log_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Middleware: логирует каждое использование бота — кто, где, что."""
+    if not update.message and not update.callback_query:
+        return
+
+    msg = update.message or (update.callback_query.message if update.callback_query else None)
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not user:
+        return
+
+    # ── Кто ──────────────────────────────────────────────────────────────────
+    user_info = f"@{user.username}" if user.username else f"id={user.id}"
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "N/A"
+
+    # ── Где ───────────────────────────────────────────────────────────────────
+    chat_types = {
+        "private":    "💬 Личка",
+        "group":      "👥 Группа",
+        "supergroup": "👥 Супергруппа",
+        "channel":    "📢 Канал",
+    }
+    chat_type_label = chat_types.get(chat.type, chat.type)
+    chat_name = chat.title if chat.title else "—"
+    chat_id_val = chat.id
+
+    # ── Что ───────────────────────────────────────────────────────────────────
+    if update.message and update.message.text:
+        text = update.message.text[:60]  # обрезаем длинные сообщения
+        action = f"text: {text!r}"
+    elif update.message and update.message.new_chat_members:
+        action = "new_member_joined"
+    else:
+        action = "other_update"
+
+    logger.info(
+        f"📥 USAGE | {chat_type_label} | "
+        f"user={user_info} ({full_name}, id={user.id}) | "
+        f"chat={chat_name!r} (id={chat_id_val}) | "
+        f"{action}"
+    )
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -610,6 +818,12 @@ def main() -> None:
         return
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Логирование — запускается первым для каждого обновления
+    app.add_handler(
+        MessageHandler(filters.ALL, log_usage),
+        group=-1,
+    )
 
     # Команды
     app.add_handler(CommandHandler("start", start))
@@ -628,6 +842,7 @@ def main() -> None:
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("crypto", crypto))
     app.add_handler(CommandHandler("altSeason", alt_season))
+    app.add_handler(CommandHandler("news", news))
 
     # Новые участники
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
