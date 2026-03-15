@@ -13,9 +13,6 @@ from telegram.ext import (
     ChatMemberHandler,
 )
 
-from dotenv import load_dotenv
-load_dotenv()
-
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -172,6 +169,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/time — Текущее время в Кишинёве\n"
         "/id — Показать ID чата\n"
         "/help — Эта справка\n\n"
+        "💎 <b>Крипто</b>\n"
+        "/crypto — Топ-10 криптовалют 📈\n"
+        "/altSeason — Индекс альтсезона 🚀\n\n"
         "<i>Бот говорит только по-русски 🇷🇺</i>"
     )
     await update.message.reply_html(text)
@@ -354,17 +354,6 @@ async def mdl_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_html(msg)
 
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Викторина о Молдове через Telegram Poll."""
-    q = random.choice(QUIZ_QUESTIONS)
-    await update.message.reply_poll(
-        question=q["question"],
-        options=q["options"],
-        type=Poll.QUIZ,
-        correct_option_id=q["answer"],
-        explanation="🇲🇩 Узнай больше о Молдове с командой /fact!",
-        is_anonymous=False,
-    )
 
 async def fuel_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Цены на топливо по заправкам Молдовы."""
@@ -403,6 +392,179 @@ async def fuel_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"📊 Разброс А-95: {spread_95} MDL  |  ДТ: {spread_dsl} MDL\n\n"
         "<i>⚠️ Цены обновляются вручную. Уточняй актуальные на АЗС.</i>"
     )
+    await update.message.reply_html(msg)
+
+
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Викторина о Молдове через Telegram Poll."""
+    q = random.choice(QUIZ_QUESTIONS)
+    await update.message.reply_poll(
+        question=q["question"],
+        options=q["options"],
+        type=Poll.QUIZ,
+        correct_option_id=q["answer"],
+        explanation="🇲🇩 Узнай больше о Молдове с командой /fact!",
+        is_anonymous=False,
+    )
+
+
+
+
+# ─── Крипто ──────────────────────────────────────────────────────────────────
+
+async def crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Топ-10 криптовалют по капитализации через CoinGecko (бесплатный API)."""
+    url = (
+        "https://api.coingecko.com/api/v3/coins/markets"
+        "?vs_currency=usd&order=market_cap_desc&per_page=10&page=1"
+        "&sparkline=false&price_change_percentage=24h"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                coins = await resp.json()
+
+        rows = ""
+        for i, c in enumerate(coins, 1):
+            name      = c["name"]
+            symbol    = c["symbol"].upper()
+            price     = c["current_price"]
+            change    = c.get("price_change_percentage_24h") or 0.0
+            mcap      = c["market_cap"]
+            arrow     = "🟢" if change >= 0 else "🔴"
+            sign      = "+" if change >= 0 else ""
+
+            # Форматируем цену красиво
+            if price >= 1:
+                price_str = f"${price:,.2f}"
+            elif price >= 0.01:
+                price_str = f"${price:.4f}"
+            else:
+                price_str = f"${price:.8f}"
+
+            # Форматируем капу: $1.23T / $456.7B / $12.3M
+            if mcap >= 1_000_000_000_000:
+                mcap_str = f"${mcap/1_000_000_000_000:.2f}T"
+            elif mcap >= 1_000_000_000:
+                mcap_str = f"${mcap/1_000_000_000:.1f}B"
+            else:
+                mcap_str = f"${mcap/1_000_000:.0f}M"
+
+            rows += (
+                f"{i}. {arrow} <b>{name}</b> ({symbol})\n"
+                f"   💵 {price_str}  {sign}{change:.1f}%  🏦 {mcap_str}\n"
+            )
+
+        msg = (
+            "💎 <b>Топ-10 криптовалют</b>\n"
+            "<i>Цена · Изменение за 24ч · Капитализация</i>\n\n"
+            f"{rows}\n"
+            "<i>Источник: CoinGecko</i>"
+        )
+    except Exception as e:
+        logger.warning(f"Crypto error: {e}")
+        msg = "⚠️ Не удалось получить данные о криптовалютах. Попробуй позже!"
+
+    await update.message.reply_html(msg)
+
+
+async def alt_season(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Индекс альтсезона.
+    Логика: берём топ-50 монет (без BTC и стейблов), считаем сколько из них
+    обогнали BTC за последние 90 дней. Если ≥75% — альтсезон. Официальная
+    методология сайта blockchaincenter.net.
+    """
+    url_top50 = (
+        "https://api.coingecko.com/api/v3/coins/markets"
+        "?vs_currency=usd&order=market_cap_desc&per_page=50&page=1"
+        "&sparkline=false&price_change_percentage=90d"
+    )
+    url_btc = (
+        "https://api.coingecko.com/api/v3/simple/price"
+        "?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
+    )
+
+    STABLECOINS = {"usdt", "usdc", "busd", "dai", "tusd", "usdp", "usdd",
+                   "frax", "lusd", "gusd", "fdusd", "pyusd"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_top50, timeout=aiohttp.ClientTimeout(total=12)) as r1:
+                if r1.status != 200:
+                    raise ValueError(f"HTTP {r1.status}")
+                top50 = await r1.json()
+
+            async with session.get(url_btc, timeout=aiohttp.ClientTimeout(total=8)) as r2:
+                if r2.status != 200:
+                    raise ValueError(f"HTTP {r2.status}")
+                btc_data = await r2.json()
+
+        # Изменение BTC за 90 дней — ищем в списке топ50
+        btc_90d = next(
+            (c.get("price_change_percentage_90d_in_currency") or 0.0
+             for c in top50 if c["symbol"].lower() == "btc"),
+            0.0
+        )
+
+        # Фильтруем: убираем BTC и стейблы
+        alts = [
+            c for c in top50
+            if c["symbol"].lower() != "btc"
+            and c["symbol"].lower() not in STABLECOINS
+        ]
+
+        # Считаем сколько алтов обогнали BTC за 90 дней
+        total = len(alts)
+        outperformed = sum(
+            1 for c in alts
+            if (c.get("price_change_percentage_90d_in_currency") or 0.0) > btc_90d
+        )
+
+        index = round((outperformed / total) * 100) if total else 0
+
+        # Определяем статус
+        if index >= 75:
+            status      = "🚀 <b>АЛЬТСЕЗОН!</b>"
+            description = "Альты рвут! Более 75% топ-50 монет обогнали Bitcoin за 90 дней."
+            verdict     = "🔥 Альтсезон в разгаре — исторически лучшее время для алтов!"
+        elif index >= 55:
+            status      = "⚡ <b>Начало альтсезона</b>"
+            description = "Альты набирают силу — больше половины обогнали BTC."
+            verdict     = "📈 Рынок разогревается. Следи за альтами внимательно."
+        elif index >= 40:
+            status      = "😐 <b>Нейтральный рынок</b>"
+            description = "Нет явного доминирования ни BTC, ни альтов."
+            verdict     = "🤷 Жди чёткого сигнала — пока рынок в равновесии."
+        elif index >= 25:
+            status      = "🟡 <b>Сезон Bitcoin</b>"
+            description = "BTC доминирует, большинство алтов отстают."
+            verdict     = "⚠️ Алты под давлением — осторожно с покупками."
+        else:
+            status      = "🟠 <b>Глубокий сезон Bitcoin</b>"
+            description = "BTC сильно обгоняет альты. Альтсезон далеко."
+            verdict     = "🛑 Альты страдают. Лучше подождать разворота."
+
+        # Визуальная шкала
+        filled = round(index / 10)
+        bar    = "█" * filled + "░" * (10 - filled)
+
+        msg = (
+            f"🌡️ <b>Индекс Альтсезона</b>\n\n"
+            f"{status}\n"
+            f"<code>[{bar}] {index}/100</code>\n\n"
+            f"📊 {outperformed} из {total} топ-алтов обогнали BTC за 90 дней\n"
+            f"₿  BTC за 90 дней: {'🟢 +' if btc_90d >= 0 else '🔴 '}{btc_90d:.1f}%\n\n"
+            f"ℹ️ {description}\n\n"
+            f"{verdict}\n\n"
+            "<i>Методология: blockchaincenter.net · Данные: CoinGecko</i>"
+        )
+    except Exception as e:
+        logger.warning(f"AltSeason error: {e}")
+        msg = "⚠️ Не удалось получить данные. Попробуй позже!"
+
     await update.message.reply_html(msg)
 
 
@@ -479,6 +641,8 @@ def main() -> None:
     app.add_handler(CommandHandler("mdl", mdl_rate))
     app.add_handler(CommandHandler("fuel", fuel_prices))
     app.add_handler(CommandHandler("quiz", quiz))
+    app.add_handler(CommandHandler("crypto", crypto))
+    app.add_handler(CommandHandler("altSeason", alt_season))
 
     # Новые участники
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
