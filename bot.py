@@ -22,7 +22,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Token ───────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN    = os.getenv("BOT_TOKEN",    "YOUR_BOT_TOKEN_HERE")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # ─── Data ────────────────────────────────────────────────────────────────────
 MOLDOVA_FACTS = [
@@ -177,7 +178,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/news — Мировые новости\n"
         "/news md — 🇲🇩 Молдова\n"
         "/news crypto — 💎 Крипто\n"
-        "/news tech — 💻 Технологии\n\n"
+        "/news tech — 💻 Технологии\n"
+        "/news uae — 🇦🇪 ОАЭ\n\n"
+        "🤖 <b>AI и разное</b>\n"
+        "/ask &lt;вопрос&gt; — Спросить у ИИ (Groq)\n"
+        "/joke — Случайная шутка 😂\n"
+        "/advice — Случайный совет 💡\n\n"
         "<i>Бот говорит только по-русски 🇷🇺</i>"
     )
     await update.message.reply_html(text)
@@ -644,6 +650,14 @@ NEWS_SOURCES = {
             ("Hacker News",  "https://hnrss.org/frontpage"),
         ],
     },
+    "uae": {
+        "label":   "🇦🇪 Новости ОАЭ",
+        "sources": [
+            ("Gulf News",       "https://gulfnews.com/rss"),
+            ("The National",    "https://www.thenationalnews.com/rss"),
+            ("Khaleej Times",   "https://www.khaleejtimes.com/rss"),
+        ],
+    },
 }
 
 NEWS_HELP = (
@@ -652,7 +666,8 @@ NEWS_HELP = (
     "  /news md      — 🇲🇩 Молдова\n"
     "  /news world   — 🌍 Мировые\n"
     "  /news crypto  — 💎 Крипто\n"
-    "  /news tech    — 💻 Технологии\n\n"
+    "  /news tech    — 💻 Технологии\n"
+    "  /news uae     — 🇦🇪 ОАЭ\n\n"
     "<i>По умолчанию: /news world</i>"
 )
 
@@ -764,6 +779,153 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+
+# ─── JokeAPI ─────────────────────────────────────────────────────────────────
+
+async def joke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Случайная шутка через JokeAPI (без ключа)."""
+    # safe=true исключает тёмные/расистские шутки
+    url = (
+        "https://v2.jokeapi.dev/joke/Programming,Misc,Pun"
+        "?lang=en&safe-mode&type=twopart,single"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                data = await resp.json()
+
+        if data.get("type") == "twopart":
+            msg = (
+                f"😂 <b>Шутка:</b>\n\n"
+                f"{data['setup']}\n\n"
+                f"<tg-spoiler>👉 {data['delivery']}</tg-spoiler>"
+            )
+        else:
+            msg = f"😂 <b>Шутка:</b>\n\n{data.get('joke', '...')}"
+
+        # Добавим категорию
+        category = data.get("category", "")
+        if category:
+            msg += f"\n\n<i>Категория: {category}</i>"
+
+    except Exception as e:
+        logger.warning(f"JokeAPI error: {e}")
+        msg = "⚠️ Не удалось получить шутку. Попробуй позже!"
+
+    await update.message.reply_html(msg)
+
+
+# ─── Advice Slip ─────────────────────────────────────────────────────────────
+
+async def advice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Случайный совет через Advice Slip API (без ключа)."""
+    url = "https://api.adviceslip.com/advice"
+    try:
+        async with aiohttp.ClientSession() as session:
+            # API кэширует — cache-busting через timestamp
+            async with session.get(
+                url,
+                params={"t": str(datetime.now().timestamp())},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                data = await resp.json(content_type=None)  # API возвращает text/html
+
+        slip = data.get("slip", {})
+        advice_text = slip.get("advice", "")
+        slip_id     = slip.get("id", "")
+
+        if not advice_text:
+            raise ValueError("empty advice")
+
+        msg = (
+            f"💡 <b>Совет дня:</b>\n\n"
+            f"<i>«{advice_text}»</i>\n\n"
+            f"<code>#{slip_id}</code>"
+        )
+    except Exception as e:
+        logger.warning(f"AdviceSlip error: {e}")
+        msg = "⚠️ Не удалось получить совет. Попробуй позже!"
+
+    await update.message.reply_html(msg)
+
+
+# ─── Groq LLM ────────────────────────────────────────────────────────────────
+
+GROQ_SYSTEM_PROMPT = (
+    "Ты полезный ассистент в Telegram-группе. "
+    "Отвечай коротко, по делу, на русском языке. "
+    "Максимум 3-4 предложения если не просят подробнее. "
+    "Не используй markdown — только обычный текст."
+)
+
+
+async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Задать вопрос LLM через Groq API (бесплатный тир)."""
+    if not GROQ_API_KEY:
+        await update.message.reply_text(
+            "⚠️ Groq API ключ не настроен.\n"
+            "Добавь GROQ_API_KEY в переменные окружения на Railway."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "🤖 Задай мне вопрос!\n"
+            "Пример: /ask Почему небо голубое?"
+        )
+        return
+
+    question = " ".join(context.args)
+    user = update.effective_user
+    thinking_msg = await update.message.reply_text("🤔 Думаю...")
+
+    try:
+        payload = {
+            "model":       "llama-3.3-70b-versatile",   # актуальная модель Groq
+            "messages":    [
+                {"role": "system",  "content": GROQ_SYSTEM_PROMPT},
+                {"role": "user",    "content": question},
+            ],
+            "max_tokens":  512,
+            "temperature": 0.7,
+        }
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type":  "application/json",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    raise ValueError(f"HTTP {resp.status}: {err[:100]}")
+                data = await resp.json()
+
+        answer = data["choices"][0]["message"]["content"].strip()
+        logger.info(f"Groq /ask | user={user.id} | q={question[:50]!r}")
+
+        msg = (
+            f"🤖 <b>Вопрос:</b> {question}\n\n"
+            f"{answer}"
+        )
+        await thinking_msg.edit_text(msg, parse_mode="HTML")
+
+    except Exception as e:
+        logger.warning(f"Groq error: {e}")
+        await thinking_msg.edit_text(
+            "⚠️ Не удалось получить ответ. Попробуй позже!"
+        )
+
+
 # ─── Логирование использования ────────────────────────────────────────────────
 
 async def log_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -842,7 +1004,10 @@ def main() -> None:
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("crypto", crypto))
     app.add_handler(CommandHandler("altSeason", alt_season))
-    app.add_handler(CommandHandler("news", news))
+    app.add_handler(CommandHandler("news",      news))
+    app.add_handler(CommandHandler("joke",      joke))
+    app.add_handler(CommandHandler("advice",    advice))
+    app.add_handler(CommandHandler("ask",       ask))
 
     # Новые участники
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
