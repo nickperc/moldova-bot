@@ -119,24 +119,6 @@ QUIZ_QUESTIONS = [
     },
 ]
 
-# ─── Цены на топливо ─────────────────────────────────────────────────────────
-# Обновляй цены вручную здесь (в MDL за литр).
-# Дата последнего обновления меняется автоматически при запуске бота,
-# но цифры нужно обновлять руками при изменении цен на АЗС.
-
-FUEL_LAST_UPDATED = "15.03.2025"   # ← меняй дату при обновлении цен
-
-FUEL_PRICES = [
-    # (название АЗС, логотип-emoji, цена А-95, цена дизель)
-    ("Bemol",        "🔵", 24.69, 22.49),
-    ("Petrom",       "🟠", 24.79, 22.59),
-    ("Lukoil",       "🔴", 24.75, 22.55),
-    ("Rompetrol",    "🟡", 24.85, 22.65),
-    ("Tirex-Petrol", "🟢", 24.59, 22.39),
-    ("Nefis",        "⚪", 24.49, 22.29),
-]
-
-
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -368,42 +350,144 @@ async def mdl_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def fuel_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Цены на топливо по заправкам Молдовы."""
+    """Цены на топливо в реальном времени с ANRE API (api.ecarburanti.anre.md)."""
 
-    # Найти мин/макс по А-95 и дизелю
-    prices_95  = [(name, p95)  for name, _, p95, _    in FUEL_PRICES]
-    prices_dsl = [(name, pdsl) for name, _, _,   pdsl in FUEL_PRICES]
+    ANRE_URL = "https://api.ecarburanti.anre.md/public"
 
-    cheapest_95  = min(prices_95,  key=lambda x: x[1])
-    cheapest_dsl = min(prices_dsl, key=lambda x: x[1])
-    priciest_95  = max(prices_95,  key=lambda x: x[1])
-    priciest_dsl = max(prices_dsl, key=lambda x: x[1])
+    # Целевые сети и их emoji
+    TARGET_STATIONS = {
+        "ROMPETROL": "🟠",
+        "VENTO":     "🟣",
+        "PETROM":    "🟡",
+        "LUKOIL":    "🔴",
+        "NOW OIL":   "⚪️",
+        "BEMOL":     "🟢",
+        "AVANTE":    "🔵",
+    }
 
-    # Таблица цен
-    rows = ""
-    for name, emoji, p95, pdsl in FUEL_PRICES:
-        # Метки «дешевле всего»
-        tag_95  = " 🏆" if name == cheapest_95[0]  else ""
-        tag_dsl = " 🏆" if name == cheapest_dsl[0] else ""
-        rows += (
-            f"{emoji} <b>{name}</b>\n"
-            f"   ⛽ А-95: <b>{p95:.2f} MDL</b>{tag_95}   "
-            f"🚛 ДТ: <b>{pdsl:.2f} MDL</b>{tag_dsl}\n"
+    def _safe_price(val) -> float | None:
+        """Возвращает float или None если значение нулевое/отсутствует."""
+        try:
+            f = float(val)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _price_str(val: float | None) -> str:
+        return f"{val:.2f} MDL" if val is not None else "—"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                ANRE_URL,
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"User-Agent": "MoldovaBot/1.0"},
+            ) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                raw: list = await resp.json(content_type=None)
+
+        from datetime import timezone, timedelta
+        month = datetime.now(timezone.utc).month
+        md_offset = timedelta(hours=3 if 3 < month < 11 else 2)
+        fetched_at = datetime.now(timezone(md_offset)).strftime("%d.%m.%Y %H:%M")
+
+        # ── Группируем все записи по имени станции ────────────────────────────
+        grouped: dict[str, list[dict]] = {target: [] for target in TARGET_STATIONS}
+
+        for record in raw:
+            name_raw: str = (record.get("station_name") or "").strip().upper()
+            matched = next(
+                (target for target in TARGET_STATIONS if target in name_raw),
+                None,
+            )
+            if matched:
+                grouped[matched].append(record)
+
+        # ── Для каждой сети ищем лучшее значение по каждому виду топлива ─────
+        # Если в первом рекорде null — перебираем остальные до первого не-null
+        def _best_fuel(records: list[dict], field: str) -> float | None:
+            for rec in records:
+                val = _safe_price(rec.get(field))
+                if val is not None:
+                    return val
+            return None  # все рекорды null или список пуст
+
+        stations: list[dict] = []
+        not_found: list[str] = []
+
+        for target, emoji in TARGET_STATIONS.items():
+            records = grouped[target]
+            if not records:
+                not_found.append(target)
+                continue
+            stations.append({
+                "name":     target,
+                "emoji":    emoji,
+                "gasoline": _best_fuel(records, "gasoline"),
+                "diesel":   _best_fuel(records, "diesel"),
+                "gpl":      _best_fuel(records, "gpl"),
+            })
+
+        if not stations:
+            raise ValueError("Нет данных от API")
+
+        # ── Сортируем по gasoline (None в конец) ─────────────────────────────
+        stations.sort(key=lambda s: s["gasoline"] if s["gasoline"] is not None else 999)
+
+        # ── Находим минимумы по каждому типу топлива ─────────────────────────
+        def _cheapest(fuel: str) -> tuple[str, float] | None:
+            valid = [(s["name"], s[fuel]) for s in stations if s[fuel] is not None]
+            return min(valid, key=lambda x: x[1]) if valid else None
+
+        best_gasoline = _cheapest("gasoline")
+        best_diesel   = _cheapest("diesel")
+        best_gpl      = _cheapest("gpl")
+
+        # ── Строим таблицу ────────────────────────────────────────────────────
+        rows = ""
+        for i, s in enumerate(stations, 1):
+            g_tag = " 🏆" if best_gasoline and s["name"] == best_gasoline[0] else ""
+            d_tag = " 🏆" if best_diesel   and s["name"] == best_diesel[0]   else ""
+            p_tag = " 🏆" if best_gpl      and s["name"] == best_gpl[0]      else ""
+
+            rows += (
+                f"{s['emoji']} <b>{s['name']}</b>\n"
+                f"   🚗 Бензин-95: <b>{_price_str(s['gasoline'])}</b>{g_tag}\n"
+                f"   🚛 Дизель: <b>{_price_str(s['diesel'])}</b>{d_tag}\n"
+                f"   🚕 Газ:    <b>{_price_str(s['gpl'])}</b>{p_tag}\n\n"
+            )
+
+        # ── Блок лучших цен ───────────────────────────────────────────────────
+        best_lines = ""
+        if best_gasoline:
+            best_lines += f"🚗 Бензин-95:  <b>{best_gasoline[0]}</b> — {best_gasoline[1]:.2f} MDL\n"
+        if best_diesel:
+            best_lines += f"🚛 Дизель:  <b>{best_diesel[0]}</b> — {best_diesel[1]:.2f} MDL\n"
+        if best_gpl:
+            best_lines += f"🚕 Газ:     <b>{best_gpl[0]}</b> — {best_gpl[1]:.2f} MDL\n"
+
+        # ── Предупреждение если сеть не найдена в API ─────────────────────────
+        not_found_line = ""
+        if not_found:
+            not_found_line = (
+                f"\n⚠️ <i>Не найдено в API: {', '.join(not_found)}</i>\n"
+            )
+
+        msg = (
+            "⛽ <b>Цены на топливо в Молдове</b>\n"
+            f"<i>🕐 Данные от: {fetched_at} | Источник: ANRE</i>\n\n"
+            f"{rows}"
+            "─────────────────────────\n"
+            f"🏆 <b>Лучшие цены:</b>\n"
+            f"{best_lines}"
+            f"{not_found_line}\n"
         )
 
-    spread_95  = round(priciest_95[1]  - cheapest_95[1],  2)
-    spread_dsl = round(priciest_dsl[1] - cheapest_dsl[1], 2)
+    except Exception as e:
+        logger.warning(f"Fuel API error: {e}")
+        msg = "⚠️ Не удалось получить цены на топливо. Попробуй позже!"
 
-    msg = (
-        "⛽ <b>Цены на топливо в Молдове</b>\n"
-        f"<i>Обновлено: {FUEL_LAST_UPDATED}</i>\n\n"
-        f"{rows}\n"
-        "─────────────────────\n"
-        f"🏆 <b>Дешевле всего А-95:</b> {cheapest_95[0]} — {cheapest_95[1]:.2f} MDL\n"
-        f"🏆 <b>Дешевле всего ДТ:</b>   {cheapest_dsl[0]} — {cheapest_dsl[1]:.2f} MDL\n\n"
-        f"📊 Разброс А-95: {spread_95} MDL  |  ДТ: {spread_dsl} MDL\n\n"
-        "<i>⚠️ Цены обновляются вручную. Уточняй актуальные на АЗС.</i>"
-    )
     await update.message.reply_html(msg)
 
 
