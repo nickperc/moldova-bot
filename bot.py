@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # ─── Token ───────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.getenv("BOT_TOKEN",    "YOUR_BOT_TOKEN_HERE")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+CMC_API_KEY  = os.getenv("CMC_API_KEY",  "")
 
 # ─── Data ────────────────────────────────────────────────────────────────────
 MOLDOVA_FACTS = [
@@ -590,56 +591,125 @@ async def crypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def alt_season(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Индекс альтсезона на основе доминации BTC. altseasonIndex = 100 - btc_dominance."""
+    """
+    Индекс альтсезона по методологии blockchaincenter.net.
+    Берём топ-50 монет из listings/latest, убираем BTC и стейблы,
+    считаем сколько из них обогнали BTC за 90 дней.
+    index = (outperformed / total) * 100
+    Если ≥ 75% — альтсезон.
+    """
+    STABLECOINS = {
+        "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "USDD",
+        "FRAX", "LUSD", "GUSD", "FDUSD", "PYUSD", "USDE",
+    }
+    CMC_HEADERS = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
+
     try:
+        params = {
+            "limit":   108,
+            "convert": "USD",
+            "sort":    "market_cap",
+        }
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                "https://api.coingecko.com/api/v3/global",
-                timeout=aiohttp.ClientTimeout(total=10),
+                "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
+                headers=CMC_HEADERS,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=12),
             ) as resp:
                 if resp.status != 200:
                     raise ValueError(f"HTTP {resp.status}")
                 data = await resp.json()
 
-        btc_dominance = data["data"]["market_cap_percentage"]["btc"]
-        index = round(100 - btc_dominance)
-        index = max(0, min(100, index))  # зажимаем в [0, 100]
+        listings = data.get("data", [])
+        if not listings:
+            raise ValueError("Пустой ответ от API")
+
+        # ── BTC 90d % ─────────────────────────────────────────────────────────
+        btc_entry = next((c for c in listings if c["symbol"] == "BTC"), None)
+        if not btc_entry:
+            raise ValueError("BTC не найден в listings")
+
+        btc_90d = (
+            btc_entry.get("quote", {})
+            .get("USD", {})
+            .get("percent_change_90d") or 0.0
+        )
+        btc_dominance = (
+            btc_entry.get("quote", {})
+            .get("USD", {})
+            .get("market_cap_dominance") or 0.0
+        )
+
+        # ── Фильтруем альткоины ───────────────────────────────────────────────
+        alts = [
+            c for c in listings
+            if c["symbol"] not in STABLECOINS | {"BTC"}
+        ]
+
+        # ── Считаем сколько обогнали BTC за 90д ──────────────────────────────
+        alts_with_data = [
+            c for c in alts
+            if c.get("quote", {}).get("USD", {}).get("percent_change_90d") is not None
+        ]
+        outperformed = sum(
+            1 for c in alts_with_data
+            if c["quote"]["USD"]["percent_change_90d"] > btc_90d
+        )
+        total = len(alts_with_data)
+        index = round((outperformed / total) * 100) if total else 0
+
+        # ── Топ-3 самых сильных алта за 90д ──────────────────────────────────
+        top_alts = sorted(
+            alts_with_data,
+            key=lambda c: c["quote"]["USD"]["percent_change_90d"],
+            reverse=True,
+        )[:3]
+        top_lines = ""
+        for c in top_alts:
+            chg = c["quote"]["USD"]["percent_change_90d"]
+            sign = "+" if chg >= 0 else ""
+            top_lines += f"  • {c['symbol']}: {sign}{chg:.1f}%\n"
 
         # ── Статус ───────────────────────────────────────────────────────────
-        if btc_dominance < 40:
+        if index >= 75:
             status      = "🚀 <b>АЛЬТСЕЗОН!</b>"
-            description = "BTC доминация ниже 40% — альты правят рынком!"
-            verdict     = "🔥 Исторически лучшее время для альткоинов!"
-        elif btc_dominance < 50:
+            description = "Более 75% топ-альтов обогнали Bitcoin за 90 дней."
+            verdict     = "🔥 Альтсезон в разгаре — исторически лучшее время для альтов!"
+        elif index >= 55:
             status      = "⚡ <b>Начало альтсезона</b>"
-            description = "BTC теряет долю рынка — альты набирают силу."
-            verdict     = "📈 Следи за альтами внимательно, рынок разогревается."
-        elif btc_dominance < 55:
+            description = "Больше половины альтов обгоняют BTC."
+            verdict     = "📈 Рынок разогревается. Следи за альтами внимательно."
+        elif index >= 40:
             status      = "😐 <b>Нейтральный рынок</b>"
             description = "Нет явного доминирования ни BTC, ни альтов."
             verdict     = "🤷 Жди чёткого сигнала — пока рынок в равновесии."
-        elif btc_dominance < 60:
+        elif index >= 25:
             status      = "🟡 <b>Сезон Bitcoin</b>"
-            description = "BTC доминирует, альты под давлением."
-            verdict     = "⚠️ Осторожно с покупкой альтов — BTC сильнее."
+            description = "BTC доминирует, большинство альтов отстают."
+            verdict     = "⚠️ Альты под давлением — осторожно с покупками."
         else:
             status      = "🟠 <b>Глубокий сезон Bitcoin</b>"
-            description = "BTC значительно доминирует на рынке."
+            description = "BTC значительно обгоняет альты."
             verdict     = "🛑 Альты страдают. Лучше подождать разворота."
 
         # ── Визуальная шкала ─────────────────────────────────────────────────
-        filled = round(index / 10)
-        bar    = "█" * filled + "░" * (10 - filled)
+        filled    = round(index / 10)
+        bar       = "█" * filled + "░" * (10 - filled)
+        btc_sign  = "+" if btc_90d >= 0 else ""
+        btc_arrow = "🟢" if btc_90d >= 0 else "🔴"
 
         msg = (
             "🌡️ <b>Индекс Альтсезона</b>\n\n"
             f"{status}\n"
             f"<code>[{bar}] {index}/100</code>\n\n"
-            f"📊 BTC доминация: <b>{btc_dominance:.2f}%</b>\n"
-            f"🔢 Формула: 100 - {btc_dominance:.2f}% = <b>{index}</b>\n\n"
+            f"📊 {outperformed} из {total} альтов обогнали BTC за 90 дней\n"
+            f"₿  BTC за 90 дней: {btc_arrow} {btc_sign}{btc_90d:.1f}%\n"
+            f"📉 BTC доминация: {btc_dominance:.2f}%\n\n"
+            f"🏅 <b>Топ альты за 90д:</b>\n{top_lines}\n"
             f"ℹ️ {description}\n\n"
             f"{verdict}\n\n"
-            "<i>Данные: CoinGecko /global</i>"
+            "<i>Методология: blockchaincenter.net · Данные: CoinMarketCap</i>"
         )
 
     except Exception as e:
