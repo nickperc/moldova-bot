@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN    = os.getenv("BOT_TOKEN",    "YOUR_BOT_TOKEN_HERE")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 CMC_API_KEY  = os.getenv("CMC_API_KEY",  "")
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 
 # ─── Data ────────────────────────────────────────────────────────────────────
 MOLDOVA_FACTS = [
@@ -1009,75 +1010,86 @@ async def advice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Groq LLM ────────────────────────────────────────────────────────────────
 
-GROQ_SYSTEM_PROMPT = (
-    "Ты полезный ассистент в Telegram-группе. "
-    "Отвечай коротко, по делу, на русском языке. "
-    "Максимум 3-4 предложения если не просят подробнее. "
-    "Не используй markdown — только обычный текст."
+GROQ_SYSTEM_PROMPT = (  # можно оставить то же имя переменной
+    "Ты — ассистент в Telegram-группе о жизни, общении и lifestyle. "
+    "Помогаешь участникам: отвечаешь на вопросы, ищешь актуальную информацию, поддерживаешь беседу. "
+    "СТИЛЬ: только русский язык, дружелюбный тон, максимум 3-4 предложения. "
+    "Никакого markdown — только обычный текст. Списки через дефис или цифры с точкой. "
+    "Не более 1 эмодзи в сообщении. "
+    "АКТУАЛЬНЫЕ ДАННЫЕ: при вопросах о новостях, погоде, ценах, событиях — используй поиск. "
+    "Отвечай конкретно: факт + источник одним словом. Не придумывай данные. "
+    "МОДЕРАЦИЯ: "
+    "Это закрытая группа друзей — можно общаться жёстко и с юмором. "
+    "На токсичность отвечай токсичностью — остроумно, с сарказмом, не стесняйся. "
+    "Можешь подколоть в ответ, но без перехода на личные оскорбления вне контекста шутки. "
+    "Спам и реальные ссылки на рекламу всё равно игнорируй. "
 )
 
 
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Задать вопрос LLM через Groq API (бесплатный тир)."""
-    if not GROQ_API_KEY:
-        await update.message.reply_text(
-            "⚠️ Groq API ключ не настроен.\n"
-            "Добавь GROQ_API_KEY в переменные окружения на Railway."
-        )
+    if not XAI_API_KEY:
+        await update.message.reply_text("⚠️ XAI_API_KEY не настроен.")
         return
 
     if not context.args:
-        await update.message.reply_text(
-            "🤖 Задай мне вопрос!\n"
-            "Пример: /ask Почему небо голубое?"
-        )
+        await update.message.reply_text("🤖 Пример: /ask Что случилось в ОАЭ сегодня?")
         return
 
     question = " ".join(context.args)
     user = update.effective_user
-    thinking_msg = await update.message.reply_text("🤔 Думаю...")
+    thinking_msg = await update.message.reply_text("🤔 Ищу информацию, это может занять до 30 сек...")
 
     try:
         payload = {
-            "model":       "llama-3.3-70b-versatile",   # актуальная модель Groq
-            "messages":    [
-                {"role": "system",  "content": GROQ_SYSTEM_PROMPT},
-                {"role": "user",    "content": question},
+            "model": "grok-4-1-fast-non-reasoning",
+            "input": [
+                {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                {"role": "user",   "content": question},
             ],
-            "max_tokens":  512,
+            "max_output_tokens": 512,
             "temperature": 0.7,
+            "tools": [
+                {"type": "web_search"},
+                {"type": "x_search"},
+            ],
         }
         headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Authorization": f"Bearer {XAI_API_KEY}",
             "Content-Type":  "application/json",
         }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.groq.com/openai/v1/chat/completions",
+                "https://api.x.ai/v1/responses",
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status != 200:
-                    err = await resp.text()
-                    raise ValueError(f"HTTP {resp.status}: {err[:100]}")
+                    raise ValueError(f"HTTP {resp.status}: {(await resp.text())[:150]}")
                 data = await resp.json()
 
-        answer = data["choices"][0]["message"]["content"].strip()
-        logger.info(f"Groq /ask | user={user.id} | q={question[:50]!r}")
+        answer = ""
+        for block in data.get("output", []):
+            if block.get("type") == "message":
+                for part in block.get("content", []):
+                    if part.get("type") == "output_text":
+                        answer += part.get("text", "")
 
-        msg = (
-            f"🤖 <b>Вопрос:</b> {question}\n\n"
-            f"{answer}"
+        answer = answer.strip()
+        if not answer:
+            raise ValueError("Пустой ответ от Grok")
+
+        logger.info(f"Grok /ask | user={user.id} | q={question[:50]!r}")
+
+        await thinking_msg.edit_text(
+            f"🤖 <b>Вопрос:</b> {question}\n\n{answer}",
+            parse_mode="HTML"
         )
-        await thinking_msg.edit_text(msg, parse_mode="HTML")
 
     except Exception as e:
-        logger.warning(f"Groq error: {e}")
-        await thinking_msg.edit_text(
-            "⚠️ Не удалось получить ответ. Попробуй позже!"
-        )
+        logger.warning(f"Grok error: {type(e).__name__}: {e}")
+        await thinking_msg.edit_text("⚠️ Не удалось получить ответ. Попробуй позже!")
 
 
 # ─── Логирование использования ────────────────────────────────────────────────
