@@ -1256,7 +1256,7 @@ def _beer_price(text: str) -> float | None:
 
 def _parse_beer_page(html: str) -> tuple[list[dict], int]:
     """Returns (qualifying_products, total_cards_on_page)."""
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     cards = soup.select("div.products-catalog-content__item")
     products = []
     for card in cards:
