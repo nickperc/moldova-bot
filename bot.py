@@ -248,13 +248,11 @@ async def choice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Текущее время в Кишинёве (UTC+2/UTC+3)."""
-    from datetime import timezone, timedelta
-    # Молдова: зимой UTC+2, летом UTC+3
-    now_utc = datetime.now(timezone.utc)
-    month = now_utc.month
-    offset = 3 if 3 < month < 11 else 2  # приблизительно летнее/зимнее время
-    chisinau_time = now_utc + timedelta(hours=offset)
+    from zoneinfo import ZoneInfo
+    chisinau_tz = ZoneInfo("Europe/Chisinau")
+    chisinau_time = datetime.now(chisinau_tz)
     formatted = chisinau_time.strftime("%H:%M:%S, %d.%m.%Y")
+    offset = chisinau_time.utcoffset().seconds // 3600
     zone_name = "EEST (UTC+3)" if offset == 3 else "EET (UTC+2)"
     await update.message.reply_text(
         f"🕐 <b>Время в Кишинёве:</b>\n{formatted}\n<i>Часовой пояс: {zone_name}</i>",
@@ -520,10 +518,8 @@ async def fuel_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     raise ValueError(f"HTTP {resp.status}")
                 raw: list = await resp.json(content_type=None)
 
-        from datetime import timezone, timedelta
-        month = datetime.now(timezone.utc).month
-        md_offset = timedelta(hours=3 if 3 < month < 11 else 2)
-        fetched_at = datetime.now(timezone(md_offset)).strftime("%d.%m.%Y %H:%M")
+        from zoneinfo import ZoneInfo
+        fetched_at = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
 
         # ── Группируем все записи по имени станции ────────────────────────────
         grouped: dict[str, list[dict]] = {target: [] for target in TARGET_STATIONS}
@@ -1370,10 +1366,8 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         products.sort(key=lambda p: p["price_new"])
         display = products if show_all else products[:10]
 
-        from datetime import timezone, timedelta
-        month = datetime.now(timezone.utc).month
-        tz = timezone(timedelta(hours=3 if 3 < month < 11 else 2))
-        updated = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+        from zoneinfo import ZoneInfo
+        updated = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
 
         title = (
             f"🍺 <b>Все акции на пиво (≤700ml) — {len(display)} шт.</b>"
