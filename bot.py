@@ -1386,7 +1386,7 @@ _WEEKDAYS_RO_RU = {
     "joi": "Чт", "vineri": "Пт", "sâmbătă": "Сб", "duminică": "Вс",
 }
 
-_LANG_LABELS = {"RU": "рус.", "RO": "рум.", "EN": "англ."}
+_LANG_LABELS = {"RU": "🇷🇺 рус.", "RO": "🇷🇴 рум.", "EN": "🇬🇧 англ."}
 
 _WEEKDAYS_RU_FULL = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
