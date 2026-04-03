@@ -3,3 +3,5 @@ aiohttp==3.10.5
 python-dotenv==1.0.1
 beautifulsoup4==4.12.3
 tzdata
+matplotlib==3.9.2
+numpy==2.1.1

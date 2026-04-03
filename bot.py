@@ -18,6 +18,8 @@ from telegram.ext import (
     ChatMemberHandler,
 )
 
+from artemis import get_artemis_data, get_artemis_text
+from artemis_viz import generate_position_map
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -181,6 +183,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🍺 <b>Пиво</b>\n"
         "/beer — Топ-10 пива со скидкой в Linella\n"
         "/beer all — Все акции на пиво\n\n"
+        "🌙 <b>Космос</b>\n"
+        "/artemis — Лунная программа NASA: позиция, телеметрия, экипаж 🌙\n\n"
         "🤖 <b>AI и разное</b>\n"
         "/ask &lt;вопрос&gt; — Спросить у ИИ (Groq)\n"
         "/joke — Случайная шутка 😂\n"
@@ -1966,6 +1970,29 @@ async def log_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ─── /artemis ────────────────────────────────────────────────────────────────
+
+async def artemis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    loading = await update.message.reply_text("🌙 Загружаю данные миссии Артемис...")
+    try:
+        data = await get_artemis_data()
+        text = get_artemis_text(data)
+        await loading.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+        buf = generate_position_map(data)
+        await update.message.reply_photo(
+            photo=buf,
+            caption="🗺 Позиция корабля Orion | Artemis II",
+        )
+    except Exception as e:
+        logger.warning(f"Artemis error: {e}")
+        await loading.edit_text(
+            "🌙 <b>Артемис</b>\n\nНе удалось загрузить данные миссии. "
+            "Попробуйте позже.\n\n🔗 nasa.gov/artemis",
+            parse_mode="HTML",
+        )
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2007,6 +2034,7 @@ def main() -> None:
     app.add_handler(CommandHandler("kiv",       kiv))
     app.add_handler(CommandHandler("cinema",    cinema))
     app.add_handler(CallbackQueryHandler(cinema_callback, pattern=r"^cinema:"))
+    app.add_handler(CommandHandler("artemis",   artemis))
 
     # Новые участники
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
