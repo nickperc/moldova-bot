@@ -5,7 +5,7 @@ import logging
 import asyncio
 import aiohttp
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from bs4 import BeautifulSoup
 from telegram import Update, Poll, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -32,7 +32,8 @@ BOT_TOKEN       = os.getenv("BOT_TOKEN",       "YOUR_BOT_TOKEN_HERE")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY",    "")
 CMC_API_KEY     = os.getenv("CMC_API_KEY",     "")
 XAI_API_KEY     = os.getenv("XAI_API_KEY",     "")
-AIRLABS_API_KEY = os.getenv("AIRLABS_API_KEY", "")
+AIRLABS_API_KEY  = os.getenv("AIRLABS_API_KEY", "")
+MORNING_CHAT_ID  = int(os.getenv("MORNING_CHAT_ID", "0"))
 
 # ─── Data ────────────────────────────────────────────────────────────────────
 MOLDOVA_FACTS = [
@@ -458,34 +459,77 @@ async def weather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(msg)
 
 
+async def _fetch_bnm_rates() -> tuple[dict[str, float], str]:
+    """
+    Fetches official BNM (National Bank of Moldova) exchange rates via XML feed.
+    Returns ({CharCode: mdl_per_1_unit}, date_str).
+    Nominal is already divided out — all values are MDL per 1 unit.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+    url = f"https://www.bnm.md/en/official_exchange_rates?get_xml=1&date={today}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            headers={"User-Agent": "MoldovaBot/1.0"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                raise ValueError(f"BNM HTTP {resp.status}")
+            raw = await resp.read()
+
+    root = ET.fromstring(raw)
+    date_str = root.get("Date", "")  # BNM uses capital D
+    rates: dict[str, float] = {}
+    for v in root.findall("Valute"):
+        code_el    = v.find("CharCode")
+        nominal_el = v.find("Nominal")
+        val_el     = v.find("Value")
+        if code_el is None or val_el is None:
+            continue
+        code = (code_el.text or "").strip()
+        mult = int(nominal_el.text) if nominal_el is not None and nominal_el.text else 1
+        try:
+            val = float((val_el.text or "").replace(",", "."))
+            rates[code] = val / mult  # normalise to per 1 unit
+        except ValueError:
+            pass
+    return rates, date_str
+
+
 async def mdl_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Курс молдавского лея (MDL) через exchangerate-api."""
-    url = "https://open.er-api.com/v6/latest/MDL"
+    """Официальный курс НБМ (Нацбанка Молдовы)."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status != 200:
-                    raise ValueError("bad status")
-                data = await resp.json()
+        rates, date_str = await _fetch_bnm_rates()
 
-        rates = data.get("rates", {})
-        usd = rates.get("USD", 0)
-        eur = rates.get("EUR", 0)
-        rub = rates.get("RUB", 0)
-        ron = rates.get("RON", 0)
-        uah = rates.get("UAH", 0)
+        def r(code: str, digits: int = 2) -> str:
+            v = rates.get(code)
+            return f"{v:.{digits}f}" if v else "—"
 
-        usd_inv = round(1 / usd, 2) if usd else "N/A"
-        eur_inv = round(1 / eur, 2) if eur else "N/A"
+        # AED: if BNM has it use it; otherwise derive from USD peg (1 USD = 3.6725 AED)
+        aed_mdl = rates.get("AED") or (rates["USD"] / 3.6725 if "USD" in rates else None)
+
+        def cross(base: str, quote: str) -> str:
+            """How many `quote` units per 1 `base` unit."""
+            b = rates.get(base)
+            q = rates.get(quote) or (rates.get("USD", 0) / 3.6725 if quote == "AED" else None)
+            if b and q:
+                return f"{b/q:.2f}"
+            return "—"
+
+        aed_line = f"🇦🇪 1 AED = <b>{aed_mdl:.2f} MDL</b>" if aed_mdl else ""
+        rub10 = f"{rates['RUB'] * 10:.2f}" if "RUB" in rates else "—"
+        uah10 = f"{rates['UAH'] * 10:.2f}" if "UAH" in rates else "—"
 
         msg = (
-            "💵 <b>Курс молдавского лея (MDL)</b>\n\n"
-            f"🇺🇸 1 USD = <b>{usd_inv} MDL</b>\n"
-            f"🇪🇺 1 EUR = <b>{eur_inv} MDL</b>\n"
-            f"🇷🇺 100 RUB = <b>{round(100 * rub, 2)} MDL</b>\n"
-            f"🇷🇴 1 RON = <b>{round(ron, 4)} MDL</b>\n"
-            f"🇺🇦 100 UAH = <b>{round(100 * uah, 2)} MDL</b>\n\n"
-            "<i>Источник: open.er-api.com</i>"
+            f"💵 <b>Официальный курс НБМ</b> · <i>{date_str}</i>\n\n"
+            f"🇺🇸 1 USD = <b>{r('USD')} MDL</b>  ·  {aed_line}\n"
+            f"🇪🇺 1 EUR = <b>{r('EUR')} MDL</b>\n"
+            f"🇬🇧 1 GBP = <b>{r('GBP')} MDL</b>  ·  🇨🇭 1 CHF = <b>{r('CHF')} MDL</b>\n"
+            f"🇮🇱 1 ILS = <b>{r('ILS')} MDL</b>  ·  🇷🇴 1 RON = <b>{r('RON')} MDL</b>\n\n"
+            f"🇷🇺 10 RUB = <b>{rub10} MDL</b>\n"
+            f"🇺🇦 10 UAH = <b>{uah10} MDL</b>\n"
+            f"🇹🇷 1 TRY = <b>{r('TRY')} MDL</b>\n\n"
+            f"<i>Источник: bnm.md</i>"
         )
     except Exception as e:
         logger.warning(f"MDL rate error: {e}")
@@ -1993,6 +2037,411 @@ async def artemis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# ─── Утренний дайджест ────────────────────────────────────────────────────────
+
+_DAY_NAMES_RU   = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
+_MONTH_NAMES_RU = ["января","февраля","марта","апреля","мая","июня",
+                   "июля","августа","сентября","октября","ноября","декабря"]
+
+
+async def _digest_weather(city: str) -> str:
+    """Compact weather block (current + tomorrow) for the digest."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            lat, lon, city_name = await _geocode(session, city)
+            params = {
+                "latitude": lat, "longitude": lon,
+                "current": ("temperature_2m,apparent_temperature,relative_humidity_2m,"
+                            "wind_speed_10m,wind_direction_10m,weather_code,uv_index"),
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum",
+                "timezone": "auto", "forecast_days": 2, "wind_speed_unit": "kmh",
+            }
+            async with session.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params=params, timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                om = await resp.json()
+
+        cur   = om["current"]
+        daily = om["daily"]
+        temp  = cur["temperature_2m"]
+        feels = cur["apparent_temperature"]
+        hum   = cur["relative_humidity_2m"]
+        wspd  = cur["wind_speed_10m"]
+        wdeg  = cur["wind_direction_10m"]
+        wcode = cur["weather_code"]
+        uv    = cur.get("uv_index") or 0
+
+        today_max  = daily["temperature_2m_max"][0]
+        today_min  = daily["temperature_2m_min"][0]
+        t_code = daily["weather_code"][1]
+        t_max  = daily["temperature_2m_max"][1]
+        t_min  = daily["temperature_2m_min"][1]
+        t_prec = ((daily.get("precipitation_sum") or [0, 0])[1]) or 0
+
+        line1 = (f"📍 <b>{city_name}</b>: {_wmo_icon(wcode)} {temp:.0f}°C (ощ. {feels:.0f}°C) · "
+                 f"📊 {today_min:.0f}…{today_max:.0f}°C · "
+                 f"💨 {wspd/3.6:.0f} м/с {_wind_dir(wdeg)} · 💧 {hum}% · UV {uv:.0f}")
+        line2 = (f"   ➡️ Завтра: {_wmo_icon(t_code)} {t_min:.0f}…{t_max:.0f}°C"
+                 + (f" · 🌂 {t_prec:.1f} мм" if t_prec > 0.1 else ""))
+        return f"{line1}\n{line2}"
+    except Exception as e:
+        logger.debug(f"Digest weather error ({city}): {e}")
+        return f"📍 <b>{city}</b>: ⚠️ нет данных"
+
+
+async def _digest_fuel() -> str:
+    """Compact best-prices block for the digest."""
+    TARGET = {"ROMPETROL", "VENTO", "PETROM", "LUKOIL", "NOW OIL", "BEMOL", "AVANTE"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.ecarburanti.anre.md/public",
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"User-Agent": "MoldovaBot/1.0"},
+            ) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                raw = await resp.json(content_type=None)
+
+        best: dict[str, tuple[str, float]] = {}
+        for rec in raw:
+            name = (rec.get("station_name") or "").strip().upper()
+            matched = next((t for t in TARGET if t in name), None)
+            if not matched:
+                continue
+            for fuel in ("gasoline", "diesel", "gpl"):
+                try:
+                    p = float(rec.get(fuel) or 0)
+                    if p > 0 and (fuel not in best or p < best[fuel][1]):
+                        best[fuel] = (matched, p)
+                except (TypeError, ValueError):
+                    pass
+
+        spec = [
+            ("gasoline", "🚗", "Бензин-95"),
+            ("diesel",   "🚛", "Дизель"),
+            ("gpl",      "🚕", "Газ"),
+        ]
+        lines = [
+            f"{em} {name}: {best[f][0]} — {best[f][1]:.2f} MDL"
+            for f, em, name in spec if f in best
+        ]
+        return "\n".join(lines) if lines else "⚠️ нет данных"
+    except Exception as e:
+        logger.debug(f"Digest fuel error: {e}")
+        return "⚠️ нет данных"
+
+
+async def _digest_rates() -> str:
+    """Returns the currency block for the digest, sourced from BNM (plain text, / separators)."""
+    try:
+        rates, date_str = await _fetch_bnm_rates()
+
+        usd  = rates.get("USD", 0)
+        eur  = rates.get("EUR", 0)
+        gbp  = rates.get("GBP", 0)
+        chf  = rates.get("CHF", 0)
+        ils  = rates.get("ILS", 0)
+        ron  = rates.get("RON", 0)
+        rub  = rates.get("RUB", 0)
+        uah  = rates.get("UAH", 0)
+        try_ = rates.get("TRY", 0)
+        aed  = rates.get("AED") or (usd / 3.6725 if usd else 0)
+
+        def _v(val: float, d: int = 2) -> str:
+            return f"{val:.{d}f}" if val else "—"
+
+        # Line 1: USD with cross-rates
+        cross = []
+        if aed:  cross.append(f"{usd/aed:.2f} AED")
+        if rub:  cross.append(f"{round(usd/rub)} RUB")
+        if uah:  cross.append(f"{round(usd/uah)} UAH")
+        if try_: cross.append(f"{round(usd/try_)} TRY")
+        usd_line = f"🇺🇸 1 USD = {_v(usd)} MDL" + (" / " + " / ".join(cross) if cross else "")
+
+        # Line 2: EUR with AED cross
+        eur_line = f"🇪🇺 1 EUR = {_v(eur)} MDL" + (f" / {eur/aed:.2f} AED" if aed and eur else "")
+
+        # Line 3: GBP + CHF
+        gbp_chf = "  ·  ".join(filter(None, [
+            f"🇬🇧 1 GBP = {_v(gbp)} MDL" if gbp else "",
+            f"🇨🇭 1 CHF = {_v(chf)} MDL" if chf else "",
+        ]))
+
+        # Line 4: ILS + RON + AED
+        misc = "  ·  ".join(filter(None, [
+            f"🇮🇱 1 ILS = {_v(ils)} MDL" if ils else "",
+            f"🇷🇴 1 RON = {_v(ron)} MDL" if ron else "",
+            f"🇦🇪 1 AED = {_v(aed)} MDL" if aed else "",
+        ]))
+
+        source = f"<i>Источник: bnm.md · {date_str}</i>"
+        return "\n".join(filter(None, [usd_line, eur_line, gbp_chf, misc, source]))
+    except Exception as e:
+        logger.debug(f"Digest rates error: {e}")
+        return "⚠️ нет данных"
+
+
+async def _digest_crypto() -> str:
+    """BTC + ETH prices from CoinGecko for the digest."""
+    url = (
+        "https://api.coingecko.com/api/v3/coins/markets"
+        "?vs_currency=usd&ids=bitcoin,ethereum&order=market_cap_desc"
+        "&sparkline=false&price_change_percentage=24h"
+    )
+    try:
+        async with aiohttp.ClientSession(headers={"User-Agent": "MoldovaBot/1.0"}) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                coins = await resp.json()
+
+        syms = {"bitcoin": "₿ BTC", "ethereum": "Ξ ETH"}
+        parts = []
+        for c in coins:
+            sym  = syms.get(c["id"], c["symbol"].upper())
+            price = c.get("current_price") or 0
+            chg   = c.get("price_change_percentage_24h") or 0
+            arrow = f"📈 +{chg:.1f}%" if chg >= 0 else f"📉 {chg:.1f}%"
+            parts.append(f"{sym} {_fmt_price(price)} {arrow}")
+        return "  ·  ".join(parts) if parts else "⚠️ нет данных"
+    except Exception as e:
+        logger.debug(f"Digest crypto error: {e}")
+        return "⚠️ нет данных"
+
+
+async def _digest_altseason() -> str:
+    """Compact altseason index line. Returns '' if no CMC key."""
+    if not CMC_API_KEY:
+        return ""
+    STABLES = {
+        "USDT","USDC","BUSD","DAI","TUSD","USDP","USDD",
+        "FRAX","LUSD","GUSD","FDUSD","PYUSD","USDE",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
+                headers={"X-CMC_PRO_API_KEY": CMC_API_KEY},
+                params={"limit": 108, "convert": "USD", "sort": "market_cap"},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}")
+                data = await resp.json()
+
+        listings = data.get("data", [])
+        btc = next((c for c in listings if c["symbol"] == "BTC"), None)
+        if not btc:
+            raise ValueError("BTC not found")
+        btc_90d = btc.get("quote", {}).get("USD", {}).get("percent_change_90d") or 0.0
+        alts = [
+            c for c in listings
+            if c["symbol"] not in STABLES | {"BTC"}
+            and c.get("quote", {}).get("USD", {}).get("percent_change_90d") is not None
+        ]
+        if not alts:
+            raise ValueError("no alts")
+        idx = round(sum(1 for c in alts if c["quote"]["USD"]["percent_change_90d"] > btc_90d)
+                    / len(alts) * 100)
+        if   idx >= 75: label = "🚀 Альтсезон!"
+        elif idx >= 55: label = "⚡ Начало альтсезона"
+        elif idx >= 40: label = "😐 Нейтральный рынок"
+        elif idx >= 25: label = "🟡 Сезон Bitcoin"
+        else:           label = "🟠 Доминация BTC"
+        return f"🌡 Альтсезон: {idx}/100 · {label}"
+    except Exception as e:
+        logger.debug(f"Digest altseason error: {e}")
+        return ""
+
+
+async def _digest_news(sources: list[tuple[str, str]], limit: int = 3) -> list[dict]:
+    """Fetches from sources list until one works. Returns items list."""
+    async with aiohttp.ClientSession() as session:
+        for _, url in sources:
+            items = await _fetch_rss(session, url, limit=limit)
+            if items:
+                return items
+    return []
+
+
+def _fmt_news_block(items: list[dict]) -> str:
+    if not items:
+        return "⚠️ нет данных"
+    lines = []
+    for i, art in enumerate(items, 1):
+        title = art["title"][:80] + "…" if len(art["title"]) > 80 else art["title"]
+        lines.append(f'{i}. <a href="{art["link"]}">{title}</a>')
+    return "\n".join(lines)
+
+
+async def _digest_meme() -> tuple[str, str]:
+    """
+    Returns (image_url, title) of a recent Iran/Trump political meme from Reddit.
+    Searches r/PoliticalHumor and r/dankmemes for relevant top posts of the week.
+    Falls back to random political meme if no match found.
+    """
+    HEADERS = {"User-Agent": "MoldovaBot/1.0 telegram-bot (github.com/moldovabot)"}
+    QUERIES = ["iran trump", "trump iran war", "iran war", "trump", "hormuz"]
+    SUBS    = ["PoliticalHumor", "dankmemes", "worldpolitics"]
+    IMG_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+    async with aiohttp.ClientSession() as session:
+        for query in QUERIES:
+            for sub in SUBS:
+                try:
+                    params = {
+                        "q": query, "sort": "top", "t": "week",
+                        "limit": 15, "restrict_sr": "1",
+                    }
+                    async with session.get(
+                        f"https://www.reddit.com/r/{sub}/search.json",
+                        headers=HEADERS, params=params,
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+
+                    for post in data.get("data", {}).get("children", []):
+                        p = post.get("data", {})
+                        if p.get("is_video") or p.get("over_18") or p.get("spoiler"):
+                            continue
+                        img = p.get("url", "")
+                        if img.lower().endswith(IMG_EXT):
+                            return img, p.get("title", "Мем дня")[:80]
+                except Exception:
+                    continue
+
+        # Fallback: top post from r/PoliticalHumor (no query filter)
+        try:
+            async with session.get(
+                "https://www.reddit.com/r/PoliticalHumor/top.json?limit=10&t=day",
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for post in data.get("data", {}).get("children", []):
+                        p = post.get("data", {})
+                        if p.get("is_video") or p.get("over_18"):
+                            continue
+                        img = p.get("url", "")
+                        if img.lower().endswith(IMG_EXT):
+                            return img, p.get("title", "Мем дня")[:80]
+        except Exception:
+            pass
+
+    logger.debug("Digest meme: no suitable image found")
+    return "", ""
+
+
+async def _digest_world_news() -> str:
+    """Top-5 world news headlines from Russian-language RSS for the digest."""
+    items = await _digest_news([
+        ("BBC Русский",  "https://feeds.bbci.co.uk/russian/rss.xml"),
+        ("РИА Новости",  "https://rsshub.app/ria/news"),
+        ("Reuters RU",   "https://feeds.reuters.com/reuters/topNews"),
+    ], limit=5)
+    return _fmt_news_block(items)
+
+
+async def morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled morning digest — sends to MORNING_CHAT_ID (or job.chat_id)."""
+    from zoneinfo import ZoneInfo
+    now      = datetime.now(ZoneInfo("Europe/Chisinau"))
+    day_name = _DAY_NAMES_RU[now.weekday()]
+    date_str = f"{now.day} {_MONTH_NAMES_RU[now.month - 1]} {now.year}"
+
+    # ── Запрашиваем всё параллельно ─────────────────────────────────────────
+    results = await asyncio.gather(
+        _digest_weather("Кишинёв"),
+        _digest_weather("Abu Dhabi"),
+        _digest_fuel(),
+        _digest_rates(),
+        _digest_crypto(),
+        _digest_altseason(),
+        _digest_world_news(),
+        _digest_meme(),
+        return_exceptions=True,
+    )
+
+    def _safe(val, fallback):
+        return val if not isinstance(val, Exception) else fallback
+
+    weather_kiv  = _safe(results[0], "📍 Кишинёв: ⚠️ нет данных")
+    weather_auh  = _safe(results[1], "📍 Абу-Даби: ⚠️ нет данных")
+    fuel_str     = _safe(results[2], "⚠️ нет данных")
+    rates_str    = _safe(results[3], "⚠️ нет данных")
+    crypto_str   = _safe(results[4], "⚠️ нет данных")
+    alt_str      = _safe(results[5], "")
+    world_news   = _safe(results[6], "⚠️ нет данных")
+    meme_result  = _safe(results[7], ("", ""))
+    meme_url, meme_title = meme_result if isinstance(meme_result, tuple) else ("", "")
+
+    # ── Сборка сообщения ─────────────────────────────────────────────────────
+    crypto_block = crypto_str + (f"\n{alt_str}" if alt_str else "")
+
+    msg = "\n\n".join([
+        f"🌅 <b>Доброе утро!</b>\n{day_name}, {date_str}",
+        f"🌤 <b>ПОГОДА</b>\n{weather_kiv}\n{weather_auh}",
+        f"⛽️ <b>ТОПЛИВО</b> (лучшие цены)\n{fuel_str}",
+        f"💵 <b>КУРС ВАЛЮТ</b>\n{rates_str}",
+        f"💎 <b>КРИПТО</b>\n{crypto_block}",
+        f"📰 <b>НОВОСТИ</b>\n{world_news}",
+        "🤖 <i>МолдоваБот · /help</i>",
+    ])
+
+    chat_id = context.job.chat_id if context.job else MORNING_CHAT_ID
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=msg,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+    # ── Мем дня — отдельным медиа ───────────────────────────────────────────
+    if meme_url:
+        caption = f"😂 <b>Мем дня:</b> {meme_title}"
+        try:
+            if meme_url.lower().endswith(".gif"):
+                await context.bot.send_animation(
+                    chat_id=chat_id, animation=meme_url,
+                    caption=caption, parse_mode="HTML",
+                )
+            else:
+                await context.bot.send_photo(
+                    chat_id=chat_id, photo=meme_url,
+                    caption=caption, parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.debug(f"Meme send failed: {e}")
+
+    logger.info(f"📬 Morning digest sent to chat {chat_id}")
+
+
+async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/digest — ручной запуск утреннего дайджеста в текущем чате."""
+    loading = await update.message.reply_text("⏳ Собираю дайджест, подождите...")
+
+    class _MockJob:
+        chat_id = update.effective_chat.id
+
+    class _MockCtx:
+        bot = context.bot
+        job = _MockJob()
+
+    try:
+        await morning_digest(_MockCtx())
+        await loading.delete()
+    except Exception as e:
+        logger.warning(f"Digest cmd error: {e}")
+        await loading.edit_text(f"⚠️ Не удалось собрать дайджест: {e}")
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2035,6 +2484,24 @@ def main() -> None:
     app.add_handler(CommandHandler("cinema",    cinema))
     app.add_handler(CallbackQueryHandler(cinema_callback, pattern=r"^cinema:"))
     app.add_handler(CommandHandler("artemis",   artemis))
+    app.add_handler(CommandHandler("digest",    digest_cmd))
+
+    # ── Утренний дайджест (ежедневно в 08:00 по Кишинёву) ────────────────────
+    if MORNING_CHAT_ID:
+        from zoneinfo import ZoneInfo
+        chisinau_tz = ZoneInfo("Europe/Chisinau")
+        app.job_queue.run_daily(
+            morning_digest,
+            time=dtime(8, 0, 0, tzinfo=chisinau_tz),
+            chat_id=MORNING_CHAT_ID,
+            name="morning_digest",
+        )
+        # ── Тестовый режим (раскомментировать одну строку для проверки) ──────
+        # app.job_queue.run_repeating(morning_digest, interval=60,  first=5, chat_id=MORNING_CHAT_ID, name="morning_digest_test")  # каждую минуту
+        # app.job_queue.run_repeating(morning_digest, interval=10,  first=5, chat_id=MORNING_CHAT_ID, name="morning_digest_test")  # каждые 10 сек
+        logger.info(f"📬 Morning digest scheduled at 08:00 Chisinau → chat {MORNING_CHAT_ID}")
+    else:
+        logger.info("📬 Morning digest disabled (MORNING_CHAT_ID not set). Use /digest manually.")
 
     # Новые участники
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
