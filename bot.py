@@ -2044,11 +2044,24 @@ _MONTH_NAMES_RU = ["января","февраля","марта","апреля","
                    "июля","августа","сентября","октября","ноября","декабря"]
 
 
+# Pre-known coordinates to avoid Nominatim rate-limit when both cities geocode in parallel
+_DIGEST_CITY_COORDS: dict[str, tuple[float, float, str]] = {
+    "Кишинёв":  (47.0105, 28.8638, "Кишинёв"),
+    "Abu Dhabi": (24.4539, 54.3773, "Abu Dhabi"),
+}
+
+
 async def _digest_weather(city: str) -> str:
     """Compact weather block (current + tomorrow) for the digest."""
     try:
+        known = _DIGEST_CITY_COORDS.get(city)
+        if known:
+            lat, lon, city_name = known
+        else:
+            async with aiohttp.ClientSession() as _s:
+                lat, lon, city_name = await _geocode(_s, city)
+
         async with aiohttp.ClientSession() as session:
-            lat, lon, city_name = await _geocode(session, city)
             params = {
                 "latitude": lat, "longitude": lon,
                 "current": ("temperature_2m,apparent_temperature,relative_humidity_2m,"
@@ -2088,7 +2101,7 @@ async def _digest_weather(city: str) -> str:
                  + (f" · 🌂 {t_prec:.1f} мм" if t_prec > 0.1 else ""))
         return f"{line1}\n{line2}"
     except Exception as e:
-        logger.debug(f"Digest weather error ({city}): {e}")
+        logger.warning(f"Digest weather error ({city}): {e}")
         return f"📍 <b>{city}</b>: ⚠️ нет данных"
 
 
@@ -2188,28 +2201,31 @@ async def _digest_rates() -> str:
 async def _digest_crypto() -> str:
     """BTC + ETH prices from CoinGecko for the digest."""
     url = (
-        "https://api.coingecko.com/api/v3/coins/markets"
-        "?vs_currency=usd&ids=bitcoin,ethereum&order=market_cap_desc"
-        "&sparkline=false&price_change_percentage=24h"
+        "https://api.coingecko.com/api/v3/simple/price"
+        "?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"
     )
     try:
         async with aiohttp.ClientSession(headers={"User-Agent": "MoldovaBot/1.0"}) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status == 429:
+                    raise ValueError("CoinGecko rate limit")
                 if resp.status != 200:
                     raise ValueError(f"HTTP {resp.status}")
-                coins = await resp.json()
+                data = await resp.json()
 
-        syms = {"bitcoin": "₿ BTC", "ethereum": "Ξ ETH"}
+        LABELS = {"bitcoin": "₿ BTC", "ethereum": "Ξ ETH"}
         parts = []
-        for c in coins:
-            sym  = syms.get(c["id"], c["symbol"].upper())
-            price = c.get("current_price") or 0
-            chg   = c.get("price_change_percentage_24h") or 0
+        for coin_id, label in LABELS.items():
+            info  = data.get(coin_id, {})
+            price = info.get("usd") or 0
+            chg   = info.get("usd_24h_change") or 0
+            if not price:
+                continue
             arrow = f"📈 +{chg:.1f}%" if chg >= 0 else f"📉 {chg:.1f}%"
-            parts.append(f"{sym} {_fmt_price(price)} {arrow}")
+            parts.append(f"{label} {_fmt_price(price)} {arrow}")
         return "  ·  ".join(parts) if parts else "⚠️ нет данных"
     except Exception as e:
-        logger.debug(f"Digest crypto error: {e}")
+        logger.warning(f"Digest crypto error: {e}")
         return "⚠️ нет данных"
 
 
@@ -2278,65 +2294,6 @@ def _fmt_news_block(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _digest_meme() -> tuple[str, str]:
-    """
-    Returns (image_url, title) of a recent Iran/Trump political meme from Reddit.
-    Searches r/PoliticalHumor and r/dankmemes for relevant top posts of the week.
-    Falls back to random political meme if no match found.
-    """
-    HEADERS = {"User-Agent": "MoldovaBot/1.0 telegram-bot (github.com/moldovabot)"}
-    QUERIES = ["iran trump", "trump iran war", "iran war", "trump", "hormuz"]
-    SUBS    = ["PoliticalHumor", "dankmemes", "worldpolitics"]
-    IMG_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp")
-
-    async with aiohttp.ClientSession() as session:
-        for query in QUERIES:
-            for sub in SUBS:
-                try:
-                    params = {
-                        "q": query, "sort": "top", "t": "week",
-                        "limit": 15, "restrict_sr": "1",
-                    }
-                    async with session.get(
-                        f"https://www.reddit.com/r/{sub}/search.json",
-                        headers=HEADERS, params=params,
-                        timeout=aiohttp.ClientTimeout(total=8),
-                    ) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-
-                    for post in data.get("data", {}).get("children", []):
-                        p = post.get("data", {})
-                        if p.get("is_video") or p.get("over_18") or p.get("spoiler"):
-                            continue
-                        img = p.get("url", "")
-                        if img.lower().endswith(IMG_EXT):
-                            return img, p.get("title", "Мем дня")[:80]
-                except Exception:
-                    continue
-
-        # Fallback: top post from r/PoliticalHumor (no query filter)
-        try:
-            async with session.get(
-                "https://www.reddit.com/r/PoliticalHumor/top.json?limit=10&t=day",
-                headers=HEADERS,
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for post in data.get("data", {}).get("children", []):
-                        p = post.get("data", {})
-                        if p.get("is_video") or p.get("over_18"):
-                            continue
-                        img = p.get("url", "")
-                        if img.lower().endswith(IMG_EXT):
-                            return img, p.get("title", "Мем дня")[:80]
-        except Exception:
-            pass
-
-    logger.debug("Digest meme: no suitable image found")
-    return "", ""
 
 
 async def _digest_world_news() -> str:
@@ -2365,7 +2322,6 @@ async def morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         _digest_crypto(),
         _digest_altseason(),
         _digest_world_news(),
-        _digest_meme(),
         return_exceptions=True,
     )
 
@@ -2379,8 +2335,6 @@ async def morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     crypto_str   = _safe(results[4], "⚠️ нет данных")
     alt_str      = _safe(results[5], "")
     world_news   = _safe(results[6], "⚠️ нет данных")
-    meme_result  = _safe(results[7], ("", ""))
-    meme_url, meme_title = meme_result if isinstance(meme_result, tuple) else ("", "")
 
     # ── Сборка сообщения ─────────────────────────────────────────────────────
     crypto_block = crypto_str + (f"\n{alt_str}" if alt_str else "")
@@ -2402,23 +2356,6 @@ async def morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
-
-    # ── Мем дня — отдельным медиа ───────────────────────────────────────────
-    if meme_url:
-        caption = f"😂 <b>Мем дня:</b> {meme_title}"
-        try:
-            if meme_url.lower().endswith(".gif"):
-                await context.bot.send_animation(
-                    chat_id=chat_id, animation=meme_url,
-                    caption=caption, parse_mode="HTML",
-                )
-            else:
-                await context.bot.send_photo(
-                    chat_id=chat_id, photo=meme_url,
-                    caption=caption, parse_mode="HTML",
-                )
-        except Exception as e:
-            logger.debug(f"Meme send failed: {e}")
 
     logger.info(f"📬 Morning digest sent to chat {chat_id}")
 
