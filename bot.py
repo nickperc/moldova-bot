@@ -2053,56 +2053,65 @@ _DIGEST_CITY_COORDS: dict[str, tuple[float, float, str]] = {
 
 async def _digest_weather(city: str) -> str:
     """Compact weather block (current + tomorrow) for the digest."""
-    try:
-        known = _DIGEST_CITY_COORDS.get(city)
-        if known:
-            lat, lon, city_name = known
-        else:
-            async with aiohttp.ClientSession() as _s:
-                lat, lon, city_name = await _geocode(_s, city)
+    known = _DIGEST_CITY_COORDS.get(city)
+    if known:
+        lat, lon, city_name = known
+    else:
+        async with aiohttp.ClientSession() as _s:
+            lat, lon, city_name = await _geocode(_s, city)
 
-        async with aiohttp.ClientSession() as session:
-            params = {
-                "latitude": lat, "longitude": lon,
-                "current": ("temperature_2m,apparent_temperature,relative_humidity_2m,"
-                            "wind_speed_10m,wind_direction_10m,weather_code,uv_index"),
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum",
-                "timezone": "auto", "forecast_days": 2, "wind_speed_unit": "kmh",
-            }
-            async with session.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params=params, timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    raise ValueError(f"HTTP {resp.status}")
-                om = await resp.json()
+    params = {
+        "latitude": lat, "longitude": lon,
+        "current": ("temperature_2m,apparent_temperature,relative_humidity_2m,"
+                    "wind_speed_10m,wind_direction_10m,weather_code,uv_index"),
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum",
+        "timezone": "auto", "forecast_days": 2, "wind_speed_unit": "kmh",
+    }
 
-        cur   = om["current"]
-        daily = om["daily"]
-        temp  = cur["temperature_2m"]
-        feels = cur["apparent_temperature"]
-        hum   = cur["relative_humidity_2m"]
-        wspd  = cur["wind_speed_10m"]
-        wdeg  = cur["wind_direction_10m"]
-        wcode = cur["weather_code"]
-        uv    = cur.get("uv_index") or 0
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(5 * attempt)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params=params, timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        raise ValueError(f"HTTP {resp.status}: {await resp.text()}")
+                    om = await resp.json()
+            if om.get("error"):
+                raise ValueError(f"Open-Meteo error: {om.get('reason')}")
 
-        today_max  = daily["temperature_2m_max"][0]
-        today_min  = daily["temperature_2m_min"][0]
-        t_code = daily["weather_code"][1]
-        t_max  = daily["temperature_2m_max"][1]
-        t_min  = daily["temperature_2m_min"][1]
-        t_prec = ((daily.get("precipitation_sum") or [0, 0])[1]) or 0
+            cur   = om["current"]
+            daily = om["daily"]
+            temp  = cur["temperature_2m"]
+            feels = cur["apparent_temperature"]
+            hum   = cur["relative_humidity_2m"]
+            wspd  = cur["wind_speed_10m"]
+            wdeg  = cur["wind_direction_10m"]
+            wcode = cur["weather_code"]
+            uv    = cur.get("uv_index") or 0
 
-        line1 = (f"📍 <b>{city_name}</b>: {_wmo_icon(wcode)} {temp:.0f}°C (ощ. {feels:.0f}°C) · "
-                 f"📊 {today_min:.0f}…{today_max:.0f}°C · "
-                 f"💨 {wspd/3.6:.0f} м/с {_wind_dir(wdeg)} · 💧 {hum}% · UV {uv:.0f}")
-        line2 = (f"   ➡️ Завтра: {_wmo_icon(t_code)} {t_min:.0f}…{t_max:.0f}°C"
-                 + (f" · 🌂 {t_prec:.1f} мм" if t_prec > 0.1 else ""))
-        return f"{line1}\n{line2}"
-    except Exception as e:
-        logger.warning(f"Digest weather error ({city}): {e}")
-        return f"📍 <b>{city}</b>: ⚠️ нет данных"
+            today_max  = daily["temperature_2m_max"][0]
+            today_min  = daily["temperature_2m_min"][0]
+            t_code = daily["weather_code"][1]
+            t_max  = daily["temperature_2m_max"][1]
+            t_min  = daily["temperature_2m_min"][1]
+            t_prec = ((daily.get("precipitation_sum") or [0, 0])[1]) or 0
+
+            line1 = (f"📍 <b>{city_name}</b>: {_wmo_icon(wcode)} {temp:.0f}°C (ощ. {feels:.0f}°C) · "
+                     f"📊 {today_min:.0f}…{today_max:.0f}°C · "
+                     f"💨 {wspd/3.6:.0f} м/с {_wind_dir(wdeg)} · 💧 {hum}% · UV {uv:.0f}")
+            line2 = (f"   ➡️ Завтра: {_wmo_icon(t_code)} {t_min:.0f}…{t_max:.0f}°C"
+                     + (f" · 🌂 {t_prec:.1f} мм" if t_prec > 0.1 else ""))
+            return f"{line1}\n{line2}"
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"Digest weather attempt {attempt+1}/3 ({city}): {type(e).__name__}: {e}")
+
+    return f"📍 <b>{city}</b>: ⚠️ нет данных"
 
 
 async def _digest_fuel() -> str:
