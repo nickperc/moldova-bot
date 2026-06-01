@@ -185,8 +185,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/beer all — Все акции на пиво\n\n"
         "🤖 <b>AI и разное</b>\n"
         "/ask &lt;вопрос&gt; — Спросить у ИИ (Groq)\n"
-        "/joke — Случайная шутка 😂\n"
-        "/advice — Случайный совет 💡\n\n"
+        "/joke — Случайная шутка 😂\n\n"
         "<i>Бот говорит только по-русски 🇷🇺</i>"
     )
     await update.message.reply_html(text)
@@ -1154,40 +1153,6 @@ async def joke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(msg)
 
 
-# ─── Advice Slip ─────────────────────────────────────────────────────────────
-
-async def advice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Случайный совет через Advice Slip API (без ключа)."""
-    url = "https://api.adviceslip.com/advice"
-    try:
-        async with aiohttp.ClientSession() as session:
-            # API кэширует — cache-busting через timestamp
-            async with session.get(
-                url,
-                params={"t": str(datetime.now().timestamp())},
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status != 200:
-                    raise ValueError(f"HTTP {resp.status}")
-                data = await resp.json(content_type=None)  # API возвращает text/html
-
-        slip = data.get("slip", {})
-        advice_text = slip.get("advice", "")
-        slip_id     = slip.get("id", "")
-
-        if not advice_text:
-            raise ValueError("empty advice")
-
-        msg = (
-            f"💡 <b>Совет дня:</b>\n\n"
-            f"<i>«{advice_text}»</i>\n\n"
-            f"<code>#{slip_id}</code>"
-        )
-    except Exception as e:
-        logger.warning(f"AdviceSlip error: {e}")
-        msg = "⚠️ Не удалось получить совет. Попробуй позже!"
-
-    await update.message.reply_html(msg)
 
 
 # ─── Рейсы KIV ───────────────────────────────────────────────────────────────
@@ -2465,7 +2430,6 @@ def main() -> None:
     app.add_handler(CommandHandler("altSeason", alt_season))
     app.add_handler(CommandHandler("news",      news))
     app.add_handler(CommandHandler("joke",      joke))
-    app.add_handler(CommandHandler("advice",    advice))
     app.add_handler(CommandHandler("ask",       ask))
     app.add_handler(CommandHandler("beer",      beer))
     app.add_handler(CommandHandler("flights",   flights))
