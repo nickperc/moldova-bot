@@ -31,6 +31,7 @@ GROQ_API_KEY    = os.getenv("GROQ_API_KEY",    "")
 CMC_API_KEY     = os.getenv("CMC_API_KEY",     "")
 XAI_API_KEY     = os.getenv("XAI_API_KEY",     "")
 AIRLABS_API_KEY  = os.getenv("AIRLABS_API_KEY", "")
+TOMTOM_API_KEY   = os.getenv("TOMTOM_API_KEY",  "")
 MORNING_CHAT_ID  = int(os.getenv("MORNING_CHAT_ID", "0"))
 
 # ─── Data ────────────────────────────────────────────────────────────────────
@@ -183,6 +184,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🍺 <b>Пиво</b>\n"
         "/beer — Топ-10 пива со скидкой в Linella\n"
         "/beer all — Все акции на пиво\n\n"
+        "🚦 <b>Транспорт</b>\n"
+        "/traffic — Дорожная ситуация в Кишинёве 🗺️\n\n"
         "🔌 <b>Отключения</b>\n"
         "/blackout — Плановые отключения света, воды, газа 🏠\n"
         "/blackout power — ⚡ Только электричество\n"
@@ -2669,6 +2672,129 @@ async def blackout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status_msg.edit_text("⚠️ Не удалось получить данные. Попробуй позже!")
 
 
+# ─── /traffic — Дорожная ситуация в Кишинёве (TomTom) ────────────────────────
+
+# Chisinau bounding box: minLon, minLat, maxLon, maxLat
+_CHISINAU_BBOX = "28.75,46.95,29.05,47.08"
+
+_INCIDENT_ICONS: dict[int, tuple[str, str]] = {
+    0:  ("❓", "Неизвестно"),
+    1:  ("💥", "Авария"),
+    2:  ("🌫️", "Туман"),
+    3:  ("⚠️", "Опасные условия"),
+    4:  ("🌧️", "Дождь"),
+    5:  ("🧊", "Лёд"),
+    6:  ("🚦", "Пробка"),
+    7:  ("↩️", "Полоса закрыта"),
+    8:  ("🚧", "Дорога закрыта"),
+    9:  ("👷", "Дорожные работы"),
+    10: ("💨", "Сильный ветер"),
+    11: ("🌊", "Затопление"),
+    12: ("🔀", "Объезд"),
+    13: ("🚦", "Затор"),
+}
+
+_DELAY_LABEL: dict[int, str] = {
+    0: "свободно", 1: "незначительная задержка",
+    2: "умеренная задержка", 3: "большая задержка", 4: "перекрыто",
+}
+
+
+async def traffic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/traffic — Дорожная ситуация в Кишинёве."""
+    if not TOMTOM_API_KEY:
+        await update.message.reply_html(
+            "⚠️ <b>TOMTOM_API_KEY не настроен.</b>\n\n"
+            "Получи бесплатный ключ (2 500 запросов/день) на "
+            '<a href="https://developer.tomtom.com">developer.tomtom.com</a> '
+            "и добавь переменную окружения <code>TOMTOM_API_KEY</code>.",
+            disable_web_page_preview=True,
+        )
+        return
+
+    status_msg = await update.message.reply_text("🚦 Проверяю дорожную ситуацию...")
+
+    try:
+        fields = (
+            "{incidents{properties{"
+            "iconCategory,magnitudeOfDelay,events{description},"
+            "from,to,delay,roadNumbers"
+            "}}}"
+        )
+        params = {
+            "key":                TOMTOM_API_KEY,
+            "bbox":               _CHISINAU_BBOX,
+            "fields":             fields,
+            "language":           "ru-RU",
+            "timeValidityFilter": "present",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.tomtom.com/traffic/services/5/incidentDetails",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"TomTom HTTP {resp.status}")
+                data = await resp.json()
+
+        incidents: list[dict] = data.get("incidents", [])
+
+        from zoneinfo import ZoneInfo
+        updated = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
+
+        if not incidents:
+            msg = (
+                f"🚦 <b>Кишинёв — дорожная ситуация</b>\n"
+                f"<i>TomTom · {updated}</i>\n\n"
+                "✅ Всё спокойно — дорожных происшествий нет!"
+            )
+            await status_msg.edit_text(msg, parse_mode="HTML")
+            return
+
+        # Group incidents by category
+        grouped: dict[int, list[dict]] = {}
+        for inc in incidents:
+            cat = inc.get("properties", {}).get("iconCategory", 0)
+            grouped.setdefault(cat, []).append(inc)
+
+        lines: list[str] = []
+        for cat in sorted(grouped):
+            icon, label = _INCIDENT_ICONS.get(cat, ("⚠️", "Происшествие"))
+            group = grouped[cat]
+            lines.append(f"\n{icon} <b>{label}</b> — {len(group)} шт.")
+            for inc in group[:4]:
+                props    = inc.get("properties", {})
+                from_rd  = props.get("from", "")
+                to_rd    = props.get("to", "")
+                delay    = props.get("delay") or 0
+                mag      = props.get("magnitudeOfDelay") or 0
+                events   = props.get("events") or []
+                desc     = events[0].get("description", "") if events else ""
+
+                location = (
+                    f"{from_rd} → {to_rd}" if from_rd and to_rd
+                    else from_rd or to_rd or desc or "—"
+                )
+                delay_str   = f" +{delay // 60} мин" if delay > 60 else ""
+                severity    = _DELAY_LABEL.get(mag, "")
+                detail      = f" ({severity})" if severity else ""
+                lines.append(f"  • {location}{delay_str}{detail}")
+
+        msg = (
+            f"🚦 <b>Кишинёв — дорожная ситуация</b>\n"
+            f"<i>TomTom · {updated} · {len(incidents)} событий</i>"
+            + "\n".join(lines)
+        )
+
+        await status_msg.edit_text(msg, parse_mode="HTML")
+
+    except Exception as e:
+        logger.warning(f"Traffic error: {type(e).__name__}: {e}")
+        await status_msg.edit_text("⚠️ Не удалось получить данные о трафике. Попробуй позже!")
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2713,6 +2839,7 @@ def main() -> None:
     app.add_handler(CommandHandler("holiday",   holiday))
     app.add_handler(CommandHandler("events",    events_cmd))
     app.add_handler(CommandHandler("blackout",  blackout))
+    app.add_handler(CommandHandler("traffic",   traffic))
 
     # ── Утренний дайджест (ежедневно в 08:00 по Кишинёву) ────────────────────
     if MORNING_CHAT_ID:
