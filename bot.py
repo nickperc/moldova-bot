@@ -31,6 +31,7 @@ GROQ_API_KEY    = os.getenv("GROQ_API_KEY",    "")
 CMC_API_KEY     = os.getenv("CMC_API_KEY",     "")
 XAI_API_KEY     = os.getenv("XAI_API_KEY",     "")
 AIRLABS_API_KEY  = os.getenv("AIRLABS_API_KEY", "")
+HERE_API_KEY     = os.getenv("HERE_API_KEY",    "")
 MORNING_CHAT_ID  = int(os.getenv("MORNING_CHAT_ID", "0"))
 
 # ─── Data ────────────────────────────────────────────────────────────────────
@@ -2671,186 +2672,165 @@ async def blackout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status_msg.edit_text("⚠️ Не удалось получить данные. Попробуй позже!")
 
 
-# ─── /traffic — Дорожная ситуация в Кишинёве (Waze) ──────────────────────────
+# ─── /traffic — Дорожная ситуация в Кишинёве (HERE Traffic) ─────────────────
 
-# Chisinau bounding box
-_KIV_TOP    = 47.08
-_KIV_BOTTOM = 46.95
-_KIV_LEFT   = 28.75
-_KIV_RIGHT  = 29.05
+# Chisinau bounding box: west,south,east,north
+_KIV_BBOX = "28.75,46.95,29.05,47.08"
 
-_WAZE_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept":          "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer":         "https://www.waze.com/live-map",
-    "X-Requested-With":"XMLHttpRequest",
-    "Origin":          "https://www.waze.com",
+_HERE_INCIDENT_ICON: dict[str, str] = {
+    "ACCIDENT":       "💥",
+    "CONGESTION":     "🚦",
+    "CONSTRUCTION":   "🚧",
+    "DISABLEDVEHICLE":"🚗",
+    "MASSIVECONGESTION": "🛑",
+    "ROADHAZARD":     "⚠️",
+    "ROADCLOSED":     "🚫",
+    "WEATHER":        "🌧️",
+    "MISC":           "ℹ️",
 }
 
-_ALERT_LABEL: dict[str, str] = {
-    "ACCIDENT":            "💥 Авария",
-    "JAM":                 "🚦 Пробка",
-    "HAZARD":              "⚠️ Опасность",
-    "ROAD_CLOSED":         "🚧 Закрыта",
-    "WEATHERHAZARD":       "🌧️ Погода",
-    "POLICE":              "👮 Полиция",
-    "CHIT_CHAT":           "💬 Сообщение",
-}
-
-_SUBTYPE_LABEL: dict[str, str] = {
-    "ACCIDENT_MAJOR":                   "Серьёзная авария",
-    "ACCIDENT_MINOR":                   "Мелкая авария",
-    "JAM_STAND_STILL_TRAFFIC":          "Стоячая пробка",
-    "JAM_HEAVY_TRAFFIC":                "Плотный трафик",
-    "JAM_MODERATE_TRAFFIC":             "Умеренный трафик",
-    "JAM_LIGHT_TRAFFIC":                "Лёгкий трафик",
-    "HAZARD_ON_ROAD_ICE":               "Лёд на дороге",
-    "HAZARD_ON_ROAD_POT_HOLE":          "Яма",
-    "HAZARD_ON_ROAD_OBJECT":            "Предмет на дороге",
-    "HAZARD_ON_ROAD_CONSTRUCTION":      "Строительство",
-    "HAZARD_ON_ROAD_TRAFFIC_LIGHT_FAULT": "Неисправный светофор",
-    "HAZARD_ON_SHOULDER_CAR_STOPPED":   "Авто на обочине",
-    "ROAD_CLOSED_CONSTRUCTION":         "Закрыта (стройка)",
-    "ROAD_CLOSED_EVENT":                "Закрыта (мероприятие)",
-    "ROAD_CLOSED_HAZARD":               "Закрыта (опасность)",
+_HERE_JAM_ICON: dict[int, str] = {
+    0: "🟢", 1: "🟡", 2: "🟠", 3: "🔴", 4: "🛑",
 }
 
 
-async def _fetch_waze(session: aiohttp.ClientSession) -> dict:
-    """Fetch live Waze data for Chisinau bbox. Returns raw JSON dict."""
-    # Warm up: visit live-map to get session cookies
-    try:
+async def _fetch_here_traffic(session: aiohttp.ClientSession) -> dict:
+    """Fetch HERE Traffic v7 flow + incidents for Chisinau bbox."""
+    if not HERE_API_KEY:
+        raise ValueError("HERE_API_KEY не задан")
+
+    base_params = {"bbox": _KIV_BBOX, "apiKey": HERE_API_KEY}
+
+    incidents_url = "https://data.traffic.hereapi.com/traffic/6.3/incidents.json"
+    flow_url      = "https://data.traffic.hereapi.com/traffic/6.3/flow.json"
+
+    async def _get(url: str, extra: dict) -> dict:
         async with session.get(
-            "https://www.waze.com/live-map",
-            headers={"User-Agent": _WAZE_HEADERS["User-Agent"]},
-            timeout=aiohttp.ClientTimeout(total=8),
-            allow_redirects=True,
-        ) as _:
-            pass
-    except Exception:
-        pass
+            url,
+            params={**base_params, **extra},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise ValueError(f"HERE {url} → HTTP {resp.status}: {text[:200]}")
+            return await resp.json()
 
-    attempts = [
-        (
-            "https://www.waze.com/live-map/api/georss",
-            {"top": _KIV_TOP, "bottom": _KIV_BOTTOM, "left": _KIV_LEFT,
-             "right": _KIV_RIGHT, "env": "row", "types": "alerts,traffic"},
-        ),
-        (
-            "https://www.waze.com/row-rtserver/web/TGeoRSS",
-            {"tk": "community", "format": "JSON", "types": "alerts,traffic",
-             "top": _KIV_TOP, "bottom": _KIV_BOTTOM, "left": _KIV_LEFT, "right": _KIV_RIGHT},
-        ),
-        (
-            "https://www.waze.com/rtserver/web/TGeoRSS",
-            {"tk": "community", "format": "JSON", "types": "alerts,traffic",
-             "top": _KIV_TOP, "bottom": _KIV_BOTTOM, "left": _KIV_LEFT, "right": _KIV_RIGHT},
-        ),
-    ]
+    results = await asyncio.gather(
+        _get(incidents_url, {"criticality": "minor,major,critical"}),
+        _get(flow_url, {"units": "metric"}),
+        return_exceptions=True,
+    )
 
-    for url, params in attempts:
-        try:
-            async with session.get(
-                url, params=params, headers=_WAZE_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=12),
-                ssl=False,
-            ) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    if text.strip().startswith("{"):
-                        import json as _json
-                        return _json.loads(text)
-            logger.debug(f"Waze {url}: status={resp.status}")
-        except Exception as e:
-            logger.debug(f"Waze {url}: {e}")
-
-    raise ValueError("Waze недоступен — все эндпоинты не ответили")
+    incidents_data = results[0] if not isinstance(results[0], Exception) else {}
+    flow_data      = results[1] if not isinstance(results[1], Exception) else {}
+    return {"incidents": incidents_data, "flow": flow_data}
 
 
 async def traffic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/traffic — Дорожная ситуация в Кишинёве (Waze)."""
+    """/traffic — Дорожная ситуация в Кишинёве (HERE Maps)."""
+    if not HERE_API_KEY:
+        await update.message.reply_text(
+            "⚠️ <b>HERE_API_KEY не настроен.</b>\n"
+            "Получи бесплатный ключ на <a href='https://developer.here.com'>developer.here.com</a> "
+            "(250 000 запросов/месяц, только email) и добавь переменную окружения <code>HERE_API_KEY</code>.",
+            parse_mode="HTML",
+        )
+        return
+
     status_msg = await update.message.reply_text("🚦 Проверяю дорожную ситуацию...")
 
     try:
         async with aiohttp.ClientSession() as session:
-            data = await _fetch_waze(session)
-
-        alerts: list[dict] = data.get("alerts") or []
-        jams:   list[dict] = data.get("jams")   or []
+            data = await _fetch_here_traffic(session)
 
         from zoneinfo import ZoneInfo
         updated = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
 
         sections: list[str] = []
 
-        # ── Jams ──────────────────────────────────────────────────────────────
-        if jams:
-            jams_sorted = sorted(jams, key=lambda j: j.get("delay", 0) or 0, reverse=True)
-            jam_lines = ["🚦 <b>Пробки:</b>"]
-            for j in jams_sorted[:6]:
-                street  = j.get("street") or j.get("line", [{}])[0].get("x", "") and "—" or "—"
-                delay   = j.get("delay") or 0
-                speed   = j.get("speed") or 0
-                length  = j.get("length") or 0
-                level   = j.get("level") or 0
+        # ── Flow (congestion) ─────────────────────────────────────────────────
+        flow_items = (
+            data.get("flow", {})
+                .get("RWS", [{}])[0]
+                .get("RW", []) if data.get("flow") else []
+        )
+        congested = []
+        for rw in flow_items:
+            for fis in rw.get("FIS", []):
+                for fi in fis.get("FI", []):
+                    cf = fi.get("CF", [{}])[0]
+                    jam_factor = cf.get("JF", 0)
+                    if jam_factor >= 4:
+                        name = rw.get("DE", "") or fi.get("TMC", {}).get("DE", "")
+                        speed_cur = cf.get("SP", 0)
+                        speed_free = cf.get("FF", 0)
+                        congested.append((jam_factor, name, speed_cur, speed_free))
 
-                level_icons = {1: "🟡", 2: "🟠", 3: "🔴", 4: "🛑", 5: "⛔"}
-                lvl_icon = level_icons.get(level, "🚦")
-
+        if congested:
+            congested.sort(reverse=True)
+            lines = ["🚦 <b>Пробки:</b>"]
+            for jf, name, sp, ff in congested[:6]:
+                icon = _HERE_JAM_ICON.get(min(int(jf // 2.5), 4), "🔴")
+                delay_pct = int((1 - sp / ff) * 100) if ff > 0 else 0
                 parts = []
-                if delay > 60:
-                    parts.append(f"+{delay // 60} мин")
-                if speed > 0:
-                    parts.append(f"{speed:.0f} км/ч")
-                if length > 0:
-                    parts.append(f"{length / 1000:.1f} км")
-
+                if sp > 0:
+                    parts.append(f"{sp:.0f} км/ч")
+                if delay_pct > 0:
+                    parts.append(f"задержка ~{delay_pct}%")
                 detail = "  ·  ".join(parts)
-                jam_lines.append(f"  {lvl_icon} {street or '—'}  {detail}")
-            sections.append("\n".join(jam_lines))
+                lines.append(f"  {icon} {name or '—'}  {detail}".rstrip())
+            sections.append("\n".join(lines))
 
-        # ── Alerts ────────────────────────────────────────────────────────────
-        if alerts:
-            # Filter out chit-chat and group by type
-            grouped: dict[str, list[dict]] = {}
-            for a in alerts:
-                t = a.get("type", "")
-                if t == "CHIT_CHAT":
-                    continue
-                grouped.setdefault(t, []).append(a)
+        # ── Incidents ─────────────────────────────────────────────────────────
+        raw_incidents = (
+            data.get("incidents", {}).get("TRAFFIC_ITEMS", {}).get("TRAFFIC_ITEM", [])
+        )
+        if isinstance(raw_incidents, dict):
+            raw_incidents = [raw_incidents]
 
-            for atype, items in sorted(grouped.items()):
-                label = _ALERT_LABEL.get(atype, f"⚠️ {atype}")
-                alert_lines = [f"{label} — {len(items)} шт."]
-                for a in items[:4]:
-                    street  = a.get("street") or a.get("nearBy") or "—"
-                    subtype = a.get("subtype") or ""
-                    sub_lbl = _SUBTYPE_LABEL.get(subtype, "")
-                    line    = f"  • {street}"
-                    if sub_lbl:
-                        line += f" ({sub_lbl})"
-                    alert_lines.append(line)
-                sections.append("\n".join(alert_lines))
+        grouped_inc: dict[str, list[str]] = {}
+        for inc in raw_incidents:
+            itype = inc.get("TRAFFIC_ITEM_TYPE_DESC", "MISC").upper()
+            loc = inc.get("LOCATION", {})
+            road = (
+                loc.get("POLITICAL_ADM_FCN3", "")
+                or loc.get("ROAD_SEGMENT_ID_LIST", {}).get("RD_SG_NAME", "")
+                or "—"
+            )
+            grouped_inc.setdefault(itype, []).append(road)
+
+        for itype, roads in sorted(grouped_inc.items()):
+            icon = _HERE_INCIDENT_ICON.get(itype, "⚠️")
+            type_ru = {
+                "ACCIDENT": "Авария", "CONGESTION": "Затор",
+                "CONSTRUCTION": "Строительство", "DISABLEDVEHICLE": "Сломанное авто",
+                "MASSIVECONGESTION": "Серьёзная пробка", "ROADHAZARD": "Опасность",
+                "ROADCLOSED": "Дорога закрыта", "WEATHER": "Погодные условия",
+                "MISC": "Прочее",
+            }.get(itype, itype)
+            lines = [f"{icon} <b>{type_ru}</b> — {len(roads)} шт."]
+            for road in roads[:4]:
+                lines.append(f"  • {road}")
+            sections.append("\n".join(lines))
 
         if not sections:
             msg = (
                 f"🚦 <b>Кишинёв — дорожная ситуация</b>\n"
-                f"<i>Waze · {updated}</i>\n\n"
+                f"<i>HERE Maps · {updated}</i>\n\n"
                 "✅ Всё спокойно — пробок и происшествий нет!"
             )
         else:
-            total_events = len(alerts) + len(jams)
+            total = len(raw_incidents) + len(congested)
             msg = (
                 f"🚦 <b>Кишинёв — дорожная ситуация</b>\n"
-                f"<i>Waze · {updated} · {total_events} событий</i>\n\n"
+                f"<i>HERE Maps · {updated} · {total} событий</i>\n\n"
                 + "\n\n".join(sections)
             )
 
         await status_msg.edit_text(msg, parse_mode="HTML")
 
     except Exception as e:
-        logger.warning(f"Traffic (Waze) error: {type(e).__name__}: {e}")
+        logger.warning(f"Traffic (HERE) error: {type(e).__name__}: {e}")
         await status_msg.edit_text("⚠️ Не удалось получить данные о трафике. Попробуй позже!")
 
 
