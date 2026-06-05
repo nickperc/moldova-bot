@@ -183,6 +183,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🍺 <b>Пиво</b>\n"
         "/beer — Топ-10 пива со скидкой в Linella\n"
         "/beer all — Все акции на пиво\n\n"
+        "🔌 <b>Отключения</b>\n"
+        "/blackout — Плановые отключения света, воды, газа 🏠\n"
+        "/blackout power — ⚡ Только электричество\n"
+        "/blackout water — 💧 Только вода\n"
+        "/blackout gas   — 🔥 Только газ\n\n"
         "🎭 <b>Афиша</b>\n"
         "/events — События в Кишинёве 🎟\n"
         "/events концерт|театр|спорт|дети|выставка — по категории\n\n"
@@ -2540,6 +2545,130 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await status_msg.edit_text("⚠️ Не удалось загрузить афишу. Попробуй позже!")
 
 
+# ─── /blackout — Отключения света, воды, газа ────────────────────────────────
+
+_BLACKOUT_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,ro;q=0.8,en;q=0.7",
+}
+
+_BLACKOUT_SOURCES = {
+    "power": [
+        ("Premier Energy", "https://www.premierenergy.md/ro/deconectari-planificate/"),
+        ("RED Nord",       "https://rednord.md/deconectari/"),
+    ],
+    "water": [
+        ("Apă-Canal Chișinău", "https://www.acsa.md/anunturi/intreruperi-in-alimentarea-cu-apa/"),
+    ],
+    "gas": [
+        ("Moldovagaz", "https://www.moldovagaz.md/avarii-si-intreruperi/"),
+    ],
+}
+
+_BLACKOUT_LABELS = {
+    "power": ("⚡", "Электричество"),
+    "water": ("💧", "Вода"),
+    "gas":   ("🔥", "Газ"),
+}
+
+
+async def _fetch_outages(session: aiohttp.ClientSession, name: str, url: str) -> list[str]:
+    """Fetch outage notices from a utility provider page. Returns list of text snippets."""
+    try:
+        async with session.get(
+            url, headers=_BLACKOUT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)
+        ) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+            html = await resp.text()
+    except Exception as e:
+        logger.warning(f"Blackout fetch error ({name}): {e}")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+
+    entries = (
+        soup.select("div.deconectare, div.outage-item, div.notice-item") or
+        soup.select("article.post, article.entry, div.article-item") or
+        soup.select("ul.outage-list li, ul.notices li") or
+        soup.select("table tr")[1:] or
+        soup.select("div.content p")
+    )
+
+    for el in entries[:5]:
+        text = el.get_text(separator=" ", strip=True)
+        if len(text) > 20:
+            text = text[:200] + "…" if len(text) > 200 else text
+            items.append(text)
+
+    return items
+
+
+async def _get_outage_block(session: aiohttp.ClientSession, kind: str) -> str:
+    """Fetch all sources for a utility type. Returns formatted HTML block."""
+    emoji, label = _BLACKOUT_LABELS[kind]
+    sources = _BLACKOUT_SOURCES[kind]
+
+    results = await asyncio.gather(*[
+        _fetch_outages(session, name, url) for name, url in sources
+    ])
+
+    lines = [f"{emoji} <b>{label}</b>"]
+    for (name, url), items in zip(sources, results):
+        if items:
+            lines.append(f"<i>{name}:</i>")
+            for item in items:
+                lines.append(f"• {item}")
+        else:
+            lines.append(f'<i><a href="{url}">{name}</a>: нет данных</i>')
+
+    return "\n".join(lines)
+
+
+async def blackout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/blackout [power|water|gas] — Плановые отключения в Молдове."""
+    arg = context.args[0].lower() if context.args else ""
+
+    arg = {"свет": "power", "электро": "power", "вода": "water", "газ": "gas"}.get(arg, arg)
+
+    if arg and arg not in _BLACKOUT_SOURCES:
+        await update.message.reply_html(
+            "❓ Использование:\n"
+            "/blackout — всё сразу\n"
+            "/blackout power — ⚡ Электричество\n"
+            "/blackout water — 💧 Вода\n"
+            "/blackout gas   — 🔥 Газ"
+        )
+        return
+
+    kinds = [arg] if arg else ["power", "water", "gas"]
+    status_msg = await update.message.reply_text("🔍 Проверяю плановые отключения...")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            blocks = await asyncio.gather(*[_get_outage_block(session, k) for k in kinds])
+
+        from zoneinfo import ZoneInfo
+        updated = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
+
+        source_map = {"power": "premierenergy.md · rednord.md", "water": "acsa.md", "gas": "moldovagaz.md"}
+        source_str = " · ".join(source_map[k] for k in kinds)
+
+        msg = (
+            f"🏠 <b>Плановые отключения в Молдове</b>\n"
+            f"<i>{source_str} · {updated}</i>\n\n"
+            + "\n\n".join(blocks)
+        )
+
+        await status_msg.edit_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+
+    except Exception as e:
+        logger.error(f"Blackout command error: {type(e).__name__}: {e}")
+        await status_msg.edit_text("⚠️ Не удалось получить данные. Попробуй позже!")
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2583,6 +2712,7 @@ def main() -> None:
     app.add_handler(CommandHandler("digest",    digest_cmd))
     app.add_handler(CommandHandler("holiday",   holiday))
     app.add_handler(CommandHandler("events",    events_cmd))
+    app.add_handler(CommandHandler("blackout",  blackout))
 
     # ── Утренний дайджест (ежедневно в 08:00 по Кишинёву) ────────────────────
     if MORNING_CHAT_ID:
