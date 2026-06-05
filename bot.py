@@ -2680,8 +2680,12 @@ _KIV_LEFT   = 28.75
 _KIV_RIGHT  = 29.05
 
 _WAZE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-    "Referer":    "https://www.waze.com/live-map",
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer":         "https://www.waze.com/live-map",
+    "X-Requested-With":"XMLHttpRequest",
+    "Origin":          "https://www.waze.com",
 }
 
 _ALERT_LABEL: dict[str, str] = {
@@ -2715,29 +2719,53 @@ _SUBTYPE_LABEL: dict[str, str] = {
 
 async def _fetch_waze(session: aiohttp.ClientSession) -> dict:
     """Fetch live Waze data for Chisinau bbox. Returns raw JSON dict."""
-    params = {
-        "top":     _KIV_TOP,
-        "bottom":  _KIV_BOTTOM,
-        "left":    _KIV_LEFT,
-        "right":   _KIV_RIGHT,
-        "env":     "row",
-        "types":   "alerts,traffic",
-    }
-    # Try primary URL, fall back to legacy
-    for url in (
-        "https://www.waze.com/live-map/api/georss",
-        "https://www.waze.com/row-rtserver/web/TGeoRSS",
-    ):
+    # Warm up: visit live-map to get session cookies
+    try:
+        async with session.get(
+            "https://www.waze.com/live-map",
+            headers={"User-Agent": _WAZE_HEADERS["User-Agent"]},
+            timeout=aiohttp.ClientTimeout(total=8),
+            allow_redirects=True,
+        ) as _:
+            pass
+    except Exception:
+        pass
+
+    attempts = [
+        (
+            "https://www.waze.com/live-map/api/georss",
+            {"top": _KIV_TOP, "bottom": _KIV_BOTTOM, "left": _KIV_LEFT,
+             "right": _KIV_RIGHT, "env": "row", "types": "alerts,traffic"},
+        ),
+        (
+            "https://www.waze.com/row-rtserver/web/TGeoRSS",
+            {"tk": "community", "format": "JSON", "types": "alerts,traffic",
+             "top": _KIV_TOP, "bottom": _KIV_BOTTOM, "left": _KIV_LEFT, "right": _KIV_RIGHT},
+        ),
+        (
+            "https://www.waze.com/rtserver/web/TGeoRSS",
+            {"tk": "community", "format": "JSON", "types": "alerts,traffic",
+             "top": _KIV_TOP, "bottom": _KIV_BOTTOM, "left": _KIV_LEFT, "right": _KIV_RIGHT},
+        ),
+    ]
+
+    for url, params in attempts:
         try:
             async with session.get(
                 url, params=params, headers=_WAZE_HEADERS,
                 timeout=aiohttp.ClientTimeout(total=12),
+                ssl=False,
             ) as resp:
                 if resp.status == 200:
-                    return await resp.json(content_type=None)
+                    text = await resp.text()
+                    if text.strip().startswith("{"):
+                        import json as _json
+                        return _json.loads(text)
+            logger.debug(f"Waze {url}: status={resp.status}")
         except Exception as e:
-            logger.debug(f"Waze fetch {url}: {e}")
-    raise ValueError("Waze недоступен")
+            logger.debug(f"Waze {url}: {e}")
+
+    raise ValueError("Waze недоступен — все эндпоинты не ответили")
 
 
 async def traffic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
