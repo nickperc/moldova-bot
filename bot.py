@@ -183,6 +183,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🍺 <b>Пиво</b>\n"
         "/beer — Топ-10 пива со скидкой в Linella\n"
         "/beer all — Все акции на пиво\n\n"
+        "🎭 <b>Афиша</b>\n"
+        "/events — События в Кишинёве 🎟\n"
+        "/events концерт|театр|спорт|дети|выставка — по категории\n\n"
         "🤖 <b>AI и разное</b>\n"
         "/ask &lt;вопрос&gt; — Спросить у ИИ (Groq)\n"
         "/joke — Случайная шутка 😂\n\n"
@@ -2396,6 +2399,147 @@ async def holiday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(title + "\n\n" + "\n".join(lines) + footer)
 
 
+# ─── /events — Афиша Кишинёва (bilete.md) ────────────────────────────────────
+
+_BILETE_BASE = "https://bilete.md"
+_BILETE_URL  = "https://bilete.md/ru"
+
+_BILETE_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
+
+_EVENT_CATEGORIES = {
+    "концерт":  "https://bilete.md/ru/concerts",
+    "театр":    "https://bilete.md/ru/theatre",
+    "спорт":    "https://bilete.md/ru/sport",
+    "дети":     "https://bilete.md/ru/children",
+    "выставка": "https://bilete.md/ru/exhibitions",
+}
+
+_EVENTS_HELP = (
+    "🎭 Использование: /events [категория]\n\n"
+    "Категории:\n"
+    "  /events концерт  — 🎵 Концерты\n"
+    "  /events театр    — 🎭 Театр\n"
+    "  /events спорт    — ⚽ Спорт\n"
+    "  /events дети     — 👶 Детские\n"
+    "  /events выставка — 🖼 Выставки\n\n"
+    "<i>По умолчанию: все события</i>"
+)
+
+
+async def _scrape_bilete(session: aiohttp.ClientSession, url: str, limit: int = 8) -> list[dict]:
+    """Scrape upcoming events from bilete.md. Returns list of {title, date, venue, url}."""
+    try:
+        async with session.get(url, headers=_BILETE_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+            html = await resp.text()
+    except Exception as e:
+        logger.warning(f"Bilete fetch error ({url}): {e}")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    events_list = []
+
+    # bilete.md event cards
+    cards = (
+        soup.select("div.event-card")
+        or soup.select("article.event")
+        or soup.select("div.poster-item")
+        or soup.select("div.item-event")
+        or soup.select("li.event-item")
+    )
+
+    for card in cards[:limit]:
+        try:
+            title_el = (
+                card.select_one("h2.event-title")
+                or card.select_one("h3.event-title")
+                or card.select_one(".event-name")
+                or card.select_one(".title")
+                or card.select_one("h2")
+                or card.select_one("h3")
+            )
+            date_el  = card.select_one(".event-date, .date, time, .when")
+            venue_el = card.select_one(".event-venue, .venue, .place, .location, .where")
+            link_el  = card.select_one("a[href]")
+
+            title = title_el.get_text(strip=True) if title_el else ""
+            date  = date_el.get_text(strip=True)  if date_el  else ""
+            venue = venue_el.get_text(strip=True)  if venue_el else ""
+            href  = link_el["href"]                if link_el  else ""
+            event_url = (_BILETE_BASE + href) if href.startswith("/") else href
+
+            if title:
+                events_list.append({"title": title, "date": date, "venue": venue, "url": event_url})
+        except Exception as e:
+            logger.debug(f"Bilete card parse error: {e}")
+
+    return events_list
+
+
+async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/events [категория] — Афиша Кишинёва с bilete.md."""
+    arg = context.args[0].lower() if context.args else ""
+
+    if arg in ("help", "?"):
+        await update.message.reply_html(_EVENTS_HELP)
+        return
+
+    if arg and arg not in _EVENT_CATEGORIES:
+        await update.message.reply_html(f"❓ Неизвестная категория <b>{arg}</b>\n\n{_EVENTS_HELP}")
+        return
+
+    url      = _EVENT_CATEGORIES.get(arg, _BILETE_URL)
+    cat_name = {
+        "концерт": "🎵 Концерты", "театр": "🎭 Театр", "спорт": "⚽ Спорт",
+        "дети": "👶 Детские", "выставка": "🖼 Выставки",
+    }.get(arg, "🎭 Все события")
+
+    status_msg = await update.message.reply_text("🎭 Загружаю афишу Кишинёва...")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            event_list = await _scrape_bilete(session, url)
+
+        if not event_list:
+            await status_msg.edit_text(
+                f"😔 Не удалось загрузить афишу.\n\n"
+                f'🔗 Открой вручную: <a href="{url}">bilete.md</a>',
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
+        from zoneinfo import ZoneInfo
+        updated = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
+
+        lines = []
+        for ev in event_list:
+            line = f'🎟 <b><a href="{ev["url"]}">{ev["title"]}</a></b>'
+            if ev["date"]:
+                line += f'\n   📅 {ev["date"]}'
+            if ev["venue"]:
+                line += f'\n   📍 {ev["venue"]}'
+            lines.append(line)
+
+        msg = (
+            f"{cat_name}\n"
+            f"<i>bilete.md · {updated}</i>\n\n"
+            + "\n\n".join(lines)
+            + f'\n\n<a href="{url}">🔗 Все события на bilete.md</a>'
+        )
+
+        await status_msg.edit_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+
+    except Exception as e:
+        logger.error(f"Events command error: {type(e).__name__}: {e}")
+        await status_msg.edit_text("⚠️ Не удалось загрузить афишу. Попробуй позже!")
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2438,6 +2582,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cinema_callback, pattern=r"^cinema:"))
     app.add_handler(CommandHandler("digest",    digest_cmd))
     app.add_handler(CommandHandler("holiday",   holiday))
+    app.add_handler(CommandHandler("events",    events_cmd))
 
     # ── Утренний дайджест (ежедневно в 08:00 по Кишинёву) ────────────────────
     if MORNING_CHAT_ID:
