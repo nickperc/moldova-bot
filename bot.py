@@ -2046,7 +2046,8 @@ _MONTH_NAMES_RU = ["января","февраля","марта","апреля","
 
 # Pre-known coordinates to avoid Nominatim rate-limit when both cities geocode in parallel
 _DIGEST_CITY_COORDS: dict[str, tuple[float, float, str]] = {
-    "Кишинёв":  (47.0105, 28.8638, "Кишинёв"),
+    "Кишинёв":   (47.0105, 28.8638, "Кишинёв"),
+    "Antalya":   (36.8969, 30.7133, "Анталия"),
     "Abu Dhabi": (24.4539, 54.3773, "Abu Dhabi"),
 }
 
@@ -2325,6 +2326,7 @@ async def morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     # ── Запрашиваем всё параллельно ─────────────────────────────────────────
     results = await asyncio.gather(
         _digest_weather("Кишинёв"),
+        _digest_weather("Antalya"),
         _digest_weather("Abu Dhabi"),
         _digest_fuel(),
         _digest_rates(),
@@ -2338,19 +2340,20 @@ async def morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         return val if not isinstance(val, Exception) else fallback
 
     weather_kiv  = _safe(results[0], "📍 Кишинёв: ⚠️ нет данных")
-    weather_auh  = _safe(results[1], "📍 Абу-Даби: ⚠️ нет данных")
-    fuel_str     = _safe(results[2], "⚠️ нет данных")
-    rates_str    = _safe(results[3], "⚠️ нет данных")
-    crypto_str   = _safe(results[4], "⚠️ нет данных")
-    alt_str      = _safe(results[5], "")
-    world_news   = _safe(results[6], "⚠️ нет данных")
+    weather_ant  = _safe(results[1], "📍 Анталия: ⚠️ нет данных")
+    weather_auh  = _safe(results[2], "📍 Абу-Даби: ⚠️ нет данных")
+    fuel_str     = _safe(results[3], "⚠️ нет данных")
+    rates_str    = _safe(results[4], "⚠️ нет данных")
+    crypto_str   = _safe(results[5], "⚠️ нет данных")
+    alt_str      = _safe(results[6], "")
+    world_news   = _safe(results[7], "⚠️ нет данных")
 
     # ── Сборка сообщения ─────────────────────────────────────────────────────
     crypto_block = crypto_str + (f"\n{alt_str}" if alt_str else "")
 
     msg = "\n\n".join([
         f"🌅 <b>Доброе утро!</b>\n{day_name}, {date_str}",
-        f"🌤 <b>ПОГОДА</b>\n{weather_kiv}\n{weather_auh}",
+        f"🌤 <b>ПОГОДА</b>\n{weather_kiv}\n{weather_ant}\n{weather_auh}",
         f"⛽️ <b>ТОПЛИВО</b> (лучшие цены)\n{fuel_str}",
         f"💵 <b>КУРС ВАЛЮТ</b>\n{rates_str}",
         f"💎 <b>КРИПТО</b>\n{crypto_block}",
