@@ -1749,11 +1749,13 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 _LINELLA_BEER_BASE  = "https://linella.md"
 _LINELLA_BEER_PROMO = "https://linella.md/en/catalog/beer?filter%5Bp%5D=on"
+# Non-alcoholic beer category (ch[80][]=574) + promo filter, Russian locale for correct naming
+_LINELLA_ZERO_PROMO = "https://linella.md/ru/catalog/pivo?ch%5B80%5D%5B%5D=574&filter%5Bp%5D=on"
 
 _BEER_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
     "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection":      "keep-alive",
 }
@@ -1838,11 +1840,14 @@ def _parse_beer_page(html: str) -> tuple[list[dict], int]:
     return products, len(cards)
 
 
-async def _scrape_linella_beer(session: aiohttp.ClientSession) -> list[dict]:
+async def _scrape_linella_beer(
+    session: aiohttp.ClientSession,
+    promo_url: str = _LINELLA_BEER_PROMO,
+) -> list[dict]:
     # Prime request to establish ci_session cookie
     try:
         async with session.get(
-            "https://linella.md/en/catalog/beer",
+            "https://linella.md/ru/catalog/pivo",
             headers=_BEER_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
@@ -1852,7 +1857,7 @@ async def _scrape_linella_beer(session: aiohttp.ClientSession) -> list[dict]:
 
     all_products: list[dict] = []
     for page in range(1, 20):
-        url = _LINELLA_BEER_PROMO if page == 1 else f"{_LINELLA_BEER_PROMO}&page={page}"
+        url = promo_url if page == 1 else f"{promo_url}&page={page}"
         try:
             async with session.get(
                 url, headers=_BEER_HEADERS,
@@ -1868,7 +1873,6 @@ async def _scrape_linella_beer(session: aiohttp.ClientSession) -> list[dict]:
 
         page_products, card_count = _parse_beer_page(html)
         if card_count == 0:
-            # No product cards at all — truly the last page
             break
         all_products.extend(page_products)
 
@@ -1904,7 +1908,10 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_msg = await update.message.reply_text("🍺 Ищу скидки на пиво в Linella...")
     try:
         async with aiohttp.ClientSession() as session:
-            products = await _scrape_linella_beer(session)
+            products = await _scrape_linella_beer(
+                session,
+                promo_url=_LINELLA_ZERO_PROMO if show_zero else _LINELLA_BEER_PROMO,
+            )
 
         # Debug: dump all scraped names so we can check keywords
         if show_names:
@@ -1913,26 +1920,22 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             lines = [f"🍺 <b>Все названия ({len(products)} шт.):</b>\n"]
             for p in products:
-                zero_mark = "🟢" if _is_nonalcoholic(p["name"]) else "⚪"
-                lines.append(f"{zero_mark} {p['name']}")
+                lines.append(f"• {p['name']}")
             text = "\n".join(lines)
-            # Telegram limit
             if len(text) > 4000:
                 text = text[:4000] + "\n…"
             await status_msg.edit_text(text, parse_mode="HTML")
             return
 
         if not products:
+            catalog_url = _LINELLA_ZERO_PROMO if show_zero else _LINELLA_BEER_PROMO
             await status_msg.edit_text(
                 "😔 Не удалось найти пиво со скидкой.\n\n"
-                f'🔗 Открой каталог вручную: <a href="{_LINELLA_BEER_PROMO}">Linella — акции на пиво</a>',
+                f'🔗 Открой каталог вручную: <a href="{catalog_url}">Linella — акции на пиво</a>',
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
             return
-
-        if show_zero:
-            products = [p for p in products if _is_nonalcoholic(p["name"])]
 
         products.sort(key=lambda p: p["price_new"])
         display = products if (show_all or show_zero) else products[:10]
@@ -1944,7 +1947,7 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not products:
                 await status_msg.edit_text(
                     "😔 Безалкогольного пива со скидкой сейчас нет.\n\n"
-                    f'🔗 Смотри весь каталог: <a href="{_LINELLA_BEER_PROMO}">Linella — акции на пиво</a>',
+                    f'🔗 Смотри весь каталог: <a href="{_LINELLA_ZERO_PROMO}">Linella — безалкогольное пиво</a>',
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
