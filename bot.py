@@ -1900,10 +1900,27 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     arg = (context.args[0].lower() if context.args else "")
     show_all    = arg == "all"
     show_zero   = arg == "0"
+    show_names  = arg == "names"
     status_msg = await update.message.reply_text("🍺 Ищу скидки на пиво в Linella...")
     try:
         async with aiohttp.ClientSession() as session:
             products = await _scrape_linella_beer(session)
+
+        # Debug: dump all scraped names so we can check keywords
+        if show_names:
+            if not products:
+                await status_msg.edit_text("😔 Ничего не найдено.")
+                return
+            lines = [f"🍺 <b>Все названия ({len(products)} шт.):</b>\n"]
+            for p in products:
+                zero_mark = "🟢" if _is_nonalcoholic(p["name"]) else "⚪"
+                lines.append(f"{zero_mark} {p['name']}")
+            text = "\n".join(lines)
+            # Telegram limit
+            if len(text) > 4000:
+                text = text[:4000] + "\n…"
+            await status_msg.edit_text(text, parse_mode="HTML")
+            return
 
         if not products:
             await status_msg.edit_text(
