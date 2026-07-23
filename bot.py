@@ -183,7 +183,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/cinema loteanu — Расписание Cineplex Loteanu\n\n"
         "🍺 <b>Пиво</b>\n"
         "/beer — Топ-10 пива со скидкой в Linella\n"
-        "/beer all — Все акции на пиво\n\n"
+        "/beer all — Все акции на пиво\n"
+        "/beer 0 — Только безалкогольное пиво 🏳️‍🌈\n\n"
         "🚦 <b>Транспорт</b>\n"
         "/traffic — Дорожная ситуация в Кишинёве 🗺️\n\n"
         "🔌 <b>Отключения</b>\n"
@@ -1872,8 +1873,31 @@ async def _scrape_linella_beer(session: aiohttp.ClientSession) -> list[dict]:
     return all_products
 
 
+_BEER_ZERO_PHRASES = [
+    "Привет, сладенький мой 🍺💕 Вот тебе список безалкогольного пивасика, чтобы ты оставался таким же свеженьким и готовым к новым приключениям. Никакого похмелья, только чистый вайб! 🏳️‍🌈",
+    "Ого, мой хороший активировал режим 0 😏 Безалкогольное пиво для тех, кто любит погорячее, но без последствий. Лови список, красотка! ✨🍻",
+    "Привет, мой пушистый топ 🐻💦 Специально для тебя — безалкогольный пивасик. Чтобы ты был бодреньким и мог всю ночь… дегустировать. Список ниже! 🏳️‍🌈",
+    "Сладенький, ты нажал 0? Как я и люблю — без лишнего градуса 😌 Лови свеженький список безалкогольного пива. Будем держать форму вместе! 🍑🍺",
+    "Йооо, мой любимый трезвенник 🔥 Вот тебе подборка безалкогольного пивасика. Чтобы ты оставался горячим, но не обжигал. Список готов, детка! 🏳️‍🌈✨",
+    "Привет, мой мягкий и нежный 🥰 Нажатие /beer 0 принято! Безалкогольное пиво для настоящих ценителей… лёгкого вкуса. Лови список, солнышко! 🍻💕",
+    "Ох, кто тут у нас без градуса сегодня? 😈 Привет, сладкий! Вот тебе список безалкогольного пивасика. Будешь пить и оставаться таким же соблазнительным. Список ниже! 🏳️‍🌈",
+    "Мой хороший, режим \"нулевой алкоголь\" активирован 💋 Лови безалкогольное пиво — для тех, кто любит всё лёгкое, воздушное и вкусное. Как ты 😉 Список готов!",
+    "Привеет, моя безалкогольная принцесса 👑🍺 Специально для тебя — список пивасика 0%. Чтобы ты мог пить сколько угодно и всё равно танцевать до утра. Го! 🏳️‍🌈",
+    "Сладенький, ты сегодня в настроении на лайт-версию? 😏 Безалкогольное пиво уже ждёт. Никакого тяжёлого утра, только приятный вкус и хорошее настроение. Лови список, мой хороший! ✨🍻💕",
+]
+
+_BEER_ZERO_KEYWORDS = ("0.0", "0,0", "безалк", "б/а", "non-alc", "non alc", "alkoholfrei", "alcohol free", "0% ", "0%alc")
+
+
+def _is_nonalcoholic(name: str) -> bool:
+    n = name.lower()
+    return any(kw in n for kw in _BEER_ZERO_KEYWORDS)
+
+
 async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    show_all = bool(context.args and context.args[0].lower() == "all")
+    arg = (context.args[0].lower() if context.args else "")
+    show_all    = arg == "all"
+    show_zero   = arg == "0"
     status_msg = await update.message.reply_text("🍺 Ищу скидки на пиво в Linella...")
     try:
         async with aiohttp.ClientSession() as session:
@@ -1888,18 +1912,34 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
+        if show_zero:
+            products = [p for p in products if _is_nonalcoholic(p["name"])]
+
         products.sort(key=lambda p: p["price_new"])
-        display = products if show_all else products[:10]
+        display = products if (show_all or show_zero) else products[:10]
 
         from zoneinfo import ZoneInfo
         updated = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
 
-        title = (
-            f"🍺 <b>Все акции на пиво (≤700ml) — {len(display)} шт.</b>"
-            if show_all else
-            "🍺 <b>Топ-10 пива со скидкой (≤700ml)</b>"
-        )
-        header = f"{title}\n<i>Linella · {updated} · {len(products)} акций найдено</i>\n"
+        if show_zero:
+            if not products:
+                await status_msg.edit_text(
+                    "😔 Безалкогольного пива со скидкой сейчас нет.\n\n"
+                    f'🔗 Смотри весь каталог: <a href="{_LINELLA_BEER_PROMO}">Linella — акции на пиво</a>',
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                return
+            import random as _random
+            zero_phrase = _random.choice(_BEER_ZERO_PHRASES)
+            title = f"🍺 <b>Безалкогольное пиво со скидкой — {len(display)} шт.</b>"
+            header = f"{zero_phrase}\n\n{title}\n<i>Linella · {updated}</i>\n"
+        elif show_all:
+            title = f"🍺 <b>Все акции на пиво (≤700ml) — {len(display)} шт.</b>"
+            header = f"{title}\n<i>Linella · {updated} · {len(products)} акций найдено</i>\n"
+        else:
+            title = "🍺 <b>Топ-10 пива со скидкой (≤700ml)</b>"
+            header = f"{title}\n<i>Linella · {updated} · {len(products)} акций найдено</i>\n"
 
         medals = ["🥇", "🥈", "🥉"] + ["🍺"] * max(0, len(display) - 3)
         footer = "<i>Сортировка: от дешёвого · Цены актуальны на момент запроса</i>"
