@@ -1905,6 +1905,53 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     show_all    = arg == "all"
     show_zero   = arg == "0"
     show_names  = arg == "names"
+    show_names0 = arg == "names0"
+
+    # Debug: scrape non-alcoholic category WITHOUT promo filter to see all 22+ items
+    if show_names0:
+        status_msg = await update.message.reply_text("🔍 Загружаю все безалкогольные пива...")
+        try:
+            _NO_PROMO = "https://linella.md/ru/catalog/pivo?ch%5B80%5D%5B%5D=574"
+            async with aiohttp.ClientSession() as session:
+                # Prime
+                try:
+                    async with session.get("https://linella.md/ru/catalog/pivo",
+                                           headers=_BEER_HEADERS,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        pass
+                except Exception:
+                    pass
+                all_raw: list[dict] = []
+                for page in range(1, 10):
+                    url = _NO_PROMO if page == 1 else f"{_NO_PROMO}&page={page}"
+                    async with session.get(url, headers=_BEER_HEADERS,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            break
+                        html = await resp.text()
+                    page_items, card_count = _parse_beer_page(html)
+                    if card_count == 0:
+                        break
+                    all_raw.extend(page_items)
+            if not all_raw:
+                await status_msg.edit_text("😔 Ничего не найдено — возможно сайт заблокировал запрос.")
+                return
+            lines = [f"🍺 <b>Безалкогольное пиво — все ({len(all_raw)} шт.):</b>\n"]
+            for p in all_raw:
+                disc = f" 🔥-{p['discount']:.0f}%" if p.get("discount", 0) > 0 else ""
+                lines.append(f"• {p['name']}{disc}")
+            text = "\n".join(lines)
+            for chunk_start in range(0, len(text), 4000):
+                chunk = text[chunk_start:chunk_start + 4000]
+                if chunk_start == 0:
+                    await status_msg.edit_text(chunk, parse_mode="HTML")
+                else:
+                    await update.message.reply_html(chunk)
+        except Exception as e:
+            logger.error(f"beer names0 error: {e}")
+            await status_msg.edit_text(f"⚠️ Ошибка: {e}")
+        return
+
     status_msg = await update.message.reply_text("🍺 Ищу скидки на пиво в Linella...")
     try:
         async with aiohttp.ClientSession() as session:
