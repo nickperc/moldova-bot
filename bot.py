@@ -1762,10 +1762,12 @@ _BEER_HEADERS = {
 def _beer_volume_ml(name: str) -> float | None:
     """Extract volume in ml from product name. Returns None if not found."""
     text = name.lower()
-    m = _re.search(r'(\d+(?:[.,]\d+)?)\s*ml\b', text)
+    # millilitres: Latin "ml" or Cyrillic "мл"
+    m = _re.search(r'(\d+(?:[.,]\d+)?)\s*(?:ml|мл)\b', text)
     if m:
         return float(m.group(1).replace(",", "."))
-    m = _re.search(r'(\d+(?:[.,]\d+)?)\s*l\b', text)
+    # litres: Latin "l" or Cyrillic "л" (word boundary handles "lager" etc.)
+    m = _re.search(r'(\d+(?:[.,]\d+)?)\s*(?:л\b|l\b)', text)
     if m:
         return float(m.group(1).replace(",", ".")) * 1000
     return None
