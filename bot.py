@@ -1886,7 +1886,7 @@ _BEER_ZERO_PHRASES = [
     "Сладенький, ты сегодня в настроении на лайт-версию? 😏 Безалкогольное пиво уже ждёт. Никакого тяжёлого утра, только приятный вкус и хорошее настроение. Лови список, мой хороший! ✨🍻💕",
 ]
 
-_BEER_ZERO_KEYWORDS = ("0.0", "0,0", "безалк", "б/а", "non-alc", "non alc", "alkoholfrei", "alcohol free", "0% ", "0%alc")
+_BEER_ZERO_KEYWORDS = ("0.0", "0,0", "безалк", "безалкогольное", "без алкогольное", "б/а", "non-alc", "non alc", "alkoholfrei", "alcohol free", "0% ", "0%alc", "№0")
 
 
 def _is_nonalcoholic(name: str) -> bool:
