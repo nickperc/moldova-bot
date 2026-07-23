@@ -1840,6 +1840,83 @@ def _parse_beer_page(html: str) -> tuple[list[dict], int]:
     return products, len(cards)
 
 
+def _parse_beer_page_all(html: str) -> tuple[list[dict], int]:
+    """Like _parse_beer_page but includes ALL products (no discount required).
+    Tries both promo price span and regular price span. Skips out-of-stock."""
+    soup = BeautifulSoup(html, "html.parser")
+    cards = soup.select("div.products-catalog-content__item")
+    products = []
+    for card in cards:
+        try:
+            name_el = card.select_one("a.products-catalog-content__name")
+            if not name_el:
+                continue
+            name = name_el.get_text(strip=True)
+            href = name_el.get("href", "")
+            url = (_LINELLA_BEER_BASE + href) if href.startswith("/") else href
+
+            vol = _beer_volume_ml(name)
+            if vol is None or vol > 700:
+                continue
+
+            # Skip out-of-stock cards
+            card_text = card.get_text(" ", strip=True).lower()
+            if "временно отсутствует" in card_text or "not available" in card_text:
+                continue
+
+            # Promo price (sale)
+            price_new_el = card.select_one("span.price-products-catalog-content__new")
+            price_old_el = card.select_one("span.price-products-catalog-content__old")
+            price_new = _beer_price(price_new_el.get_text()) if price_new_el else None
+            price_old = _beer_price(price_old_el.get_text()) if price_old_el else None
+
+            # Regular price fallback — try common selectors
+            if price_new is None:
+                for sel in (
+                    "span.price-products-catalog-content__actual",
+                    "span.price-products-catalog-content__price",
+                    "div.price-products-catalog-content__item",
+                    "div.price-products-catalog-content",
+                ):
+                    el = card.select_one(sel)
+                    if el:
+                        p = _beer_price(el.get_text())
+                        if p:
+                            price_new = p
+                            break
+
+            # Last resort: first price pattern in the whole card
+            if price_new is None:
+                m = _re.search(r'\b(\d{1,3}[.,]\d{2})\b', card_text)
+                if m:
+                    price_new = float(m.group(1).replace(",", "."))
+
+            if price_new is None:
+                continue
+
+            # Discount
+            discount = 0.0
+            disc_el = card.select_one("div.price-products-catalog-content__discount")
+            if disc_el:
+                dm = _re.search(r'(\d+)', disc_el.get_text())
+                if dm:
+                    discount = float(dm.group(1))
+            elif price_old and price_old > price_new:
+                discount = round((1 - price_new / price_old) * 100, 1)
+
+            products.append({
+                "name":      name,
+                "url":       url,
+                "volume_ml": vol,
+                "price_new": price_new,
+                "price_old": price_old,
+                "discount":  discount,
+            })
+        except Exception as e:
+            logger.debug(f"Beer card parse error: {e}")
+    return products, len(cards)
+
+
 async def _scrape_linella_beer(
     session: aiohttp.ClientSession,
     promo_url: str = _LINELLA_BEER_PROMO,
@@ -1977,11 +2054,32 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     status_msg = await update.message.reply_text("🍺 Ищу скидки на пиво в Linella...")
     try:
+        _ZERO_ALL_URL = "https://linella.md/ru/catalog/pivo?ch%5B80%5D%5B%5D=574"
+
         async with aiohttp.ClientSession() as session:
-            products = await _scrape_linella_beer(
-                session,
-                promo_url=_LINELLA_ZERO_PROMO if show_zero else _LINELLA_BEER_PROMO,
-            )
+            if show_zero:
+                # Scrape ALL non-alcoholic beers (not just discounted)
+                try:
+                    async with session.get("https://linella.md/ru/catalog/pivo",
+                                           headers=_BEER_HEADERS,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        pass
+                except Exception:
+                    pass
+                products = []
+                for page in range(1, 10):
+                    url = _ZERO_ALL_URL if page == 1 else f"{_ZERO_ALL_URL}&page={page}"
+                    async with session.get(url, headers=_BEER_HEADERS,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            break
+                        html = await resp.text()
+                    page_items, card_count = _parse_beer_page_all(html)
+                    if card_count == 0:
+                        break
+                    products.extend(page_items)
+            else:
+                products = await _scrape_linella_beer(session, promo_url=_LINELLA_BEER_PROMO)
 
         # Debug: dump all scraped names so we can check keywords
         if show_names:
@@ -1998,10 +2096,10 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if not products:
-            catalog_url = _LINELLA_ZERO_PROMO if show_zero else _LINELLA_BEER_PROMO
+            catalog_url = _ZERO_ALL_URL if show_zero else _LINELLA_BEER_PROMO
             await status_msg.edit_text(
-                "😔 Не удалось найти пиво со скидкой.\n\n"
-                f'🔗 Открой каталог вручную: <a href="{catalog_url}">Linella — акции на пиво</a>',
+                "😔 Не удалось найти пиво.\n\n"
+                f'🔗 Открой каталог вручную: <a href="{catalog_url}">Linella — пиво</a>',
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
@@ -2014,17 +2112,10 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         updated = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
 
         if show_zero:
-            if not products:
-                await status_msg.edit_text(
-                    "😔 Безалкогольного пива со скидкой сейчас нет.\n\n"
-                    f'🔗 Смотри весь каталог: <a href="{_LINELLA_ZERO_PROMO}">Linella — безалкогольное пиво</a>',
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                return
             import random as _random
             zero_phrase = _random.choice(_BEER_ZERO_PHRASES)
-            title = f"🍺 <b>Безалкогольное пиво со скидкой — {len(display)} шт.</b>"
+            n_sale = sum(1 for p in display if p["discount"] > 0)
+            title = f"🍺 <b>Безалкогольное пиво — {len(display)} шт. ({n_sale} со скидкой)</b>"
             header = f"{zero_phrase}\n\n{title}\n<i>Linella · {updated}</i>\n"
         elif show_all:
             title = f"🍺 <b>Все акции на пиво (≤700ml) — {len(display)} шт.</b>"
@@ -2040,14 +2131,18 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         entry_lines = []
         for i, p in enumerate(display):
             vol = p["volume_ml"]
-            vol_str = f"{int(vol)}ml" if vol < 1000 else f"{vol / 1000:.2g}L"
+            vol_str = f"{int(vol)}мл" if vol < 1000 else f"{vol / 1000:.2g}л"
             name_link = f'<a href="{p["url"]}">{p["name"]}</a>'
-            entry_lines.append(
-                f"{medals[i]} {name_link} · {vol_str} · "
-                f"<b>{p['price_new']:.2f}</b> MDL "
-                f"(<s>{p['price_old']:.2f}</s>) "
-                f"🔥 -{p['discount']:.0f}%"
-            )
+            if show_zero and p["discount"] > 0 and p.get("price_old"):
+                price_str = (
+                    f"<b>{p['price_new']:.2f}</b> MDL "
+                    f"(<s>{p['price_old']:.2f}</s>) 🔥 -{p['discount']:.0f}%"
+                )
+            else:
+                price_str = f"<b>{p['price_new']:.2f}</b> MDL"
+                if show_zero and p["discount"] > 0:
+                    price_str += f" 🔥 -{p['discount']:.0f}%"
+            entry_lines.append(f"{medals[i]} {name_link} · {vol_str} · {price_str}")
 
         # Split into messages respecting Telegram's 4096-char limit
         LIMIT = 4000
