@@ -1912,8 +1912,30 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status_msg = await update.message.reply_text("🔍 Загружаю все безалкогольные пива...")
         try:
             _NO_PROMO = "https://linella.md/ru/catalog/pivo?ch%5B80%5D%5B%5D=574"
+
+            def _parse_all_names(html: str) -> tuple[list[dict], int]:
+                """Parse ALL products regardless of price/discount."""
+                soup = BeautifulSoup(html, "html.parser")
+                cards = soup.select("div.products-catalog-content__item")
+                items = []
+                for card in cards:
+                    name_el = card.select_one("a.products-catalog-content__name")
+                    if not name_el:
+                        continue
+                    name = name_el.get_text(strip=True)
+                    # Check for discount badge
+                    disc_el = card.select_one("div.price-products-catalog-content__discount")
+                    discount = 0.0
+                    if disc_el:
+                        dm = _re.search(r'(\d+)', disc_el.get_text())
+                        if dm:
+                            discount = float(dm.group(1))
+                    # Check out-of-stock
+                    oos = bool(card.select_one("div.products-catalog-content__not-available, .not-available"))
+                    items.append({"name": name, "discount": discount, "oos": oos})
+                return items, len(cards)
+
             async with aiohttp.ClientSession() as session:
-                # Prime
                 try:
                     async with session.get("https://linella.md/ru/catalog/pivo",
                                            headers=_BEER_HEADERS,
@@ -1929,7 +1951,7 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         if resp.status != 200:
                             break
                         html = await resp.text()
-                    page_items, card_count = _parse_beer_page(html)
+                    page_items, card_count = _parse_all_names(html)
                     if card_count == 0:
                         break
                     all_raw.extend(page_items)
@@ -1939,7 +1961,8 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             lines = [f"🍺 <b>Безалкогольное пиво — все ({len(all_raw)} шт.):</b>\n"]
             for p in all_raw:
                 disc = f" 🔥-{p['discount']:.0f}%" if p.get("discount", 0) > 0 else ""
-                lines.append(f"• {p['name']}{disc}")
+                oos  = " ❌ нет в наличии" if p.get("oos") else ""
+                lines.append(f"• {p['name']}{disc}{oos}")
             text = "\n".join(lines)
             for chunk_start in range(0, len(text), 4000):
                 chunk = text[chunk_start:chunk_start + 4000]
