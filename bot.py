@@ -183,7 +183,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/cinema loteanu — Расписание Cineplex Loteanu\n\n"
         "🍺 <b>Пиво</b>\n"
         "/beer — Топ-10 пива со скидкой в Linella\n"
-        "/beer all — Все акции на пиво\n\n"
+        "/beer all — Все акции на пиво\n"
+        "/beer 0 — Только безалкогольное пиво 🏳️‍🌈\n\n"
         "🚦 <b>Транспорт</b>\n"
         "/traffic — Дорожная ситуация в Кишинёве 🗺️\n\n"
         "🔌 <b>Отключения</b>\n"
@@ -1748,11 +1749,13 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 _LINELLA_BEER_BASE  = "https://linella.md"
 _LINELLA_BEER_PROMO = "https://linella.md/en/catalog/beer?filter%5Bp%5D=on"
+# Non-alcoholic beer category (ch[80][]=574) + promo filter, Russian locale for correct naming
+_LINELLA_ZERO_PROMO = "https://linella.md/ru/catalog/pivo?ch%5B80%5D%5B%5D=574&filter%5Bp%5D=on"
 
 _BEER_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
     "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection":      "keep-alive",
 }
@@ -1761,10 +1764,12 @@ _BEER_HEADERS = {
 def _beer_volume_ml(name: str) -> float | None:
     """Extract volume in ml from product name. Returns None if not found."""
     text = name.lower()
-    m = _re.search(r'(\d+(?:[.,]\d+)?)\s*ml\b', text)
+    # millilitres: Latin "ml" or Cyrillic "мл"
+    m = _re.search(r'(\d+(?:[.,]\d+)?)\s*(?:ml|мл)\b', text)
     if m:
         return float(m.group(1).replace(",", "."))
-    m = _re.search(r'(\d+(?:[.,]\d+)?)\s*l\b', text)
+    # litres: Latin "l" or Cyrillic "л" (word boundary handles "lager" etc.)
+    m = _re.search(r'(\d+(?:[.,]\d+)?)\s*(?:л\b|l\b)', text)
     if m:
         return float(m.group(1).replace(",", ".")) * 1000
     return None
@@ -1835,11 +1840,91 @@ def _parse_beer_page(html: str) -> tuple[list[dict], int]:
     return products, len(cards)
 
 
-async def _scrape_linella_beer(session: aiohttp.ClientSession) -> list[dict]:
+def _parse_beer_page_all(html: str) -> tuple[list[dict], int]:
+    """Like _parse_beer_page but includes ALL products (no discount required).
+    Tries both promo price span and regular price span. Skips out-of-stock."""
+    soup = BeautifulSoup(html, "html.parser")
+    cards = soup.select("div.products-catalog-content__item")
+    products = []
+    for card in cards:
+        try:
+            name_el = card.select_one("a.products-catalog-content__name")
+            if not name_el:
+                continue
+            name = name_el.get_text(strip=True)
+            href = name_el.get("href", "")
+            url = (_LINELLA_BEER_BASE + href) if href.startswith("/") else href
+
+            vol = _beer_volume_ml(name)
+            if vol is None or vol > 700:
+                continue
+
+            # Skip out-of-stock cards
+            card_text = card.get_text(" ", strip=True).lower()
+            if "временно отсутствует" in card_text or "not available" in card_text:
+                continue
+
+            # Promo price (sale)
+            price_new_el = card.select_one("span.price-products-catalog-content__new")
+            price_old_el = card.select_one("span.price-products-catalog-content__old")
+            price_new = _beer_price(price_new_el.get_text()) if price_new_el else None
+            price_old = _beer_price(price_old_el.get_text()) if price_old_el else None
+
+            # Regular price fallback — try common selectors
+            if price_new is None:
+                for sel in (
+                    "span.price-products-catalog-content__actual",
+                    "span.price-products-catalog-content__price",
+                    "div.price-products-catalog-content__item",
+                    "div.price-products-catalog-content",
+                ):
+                    el = card.select_one(sel)
+                    if el:
+                        p = _beer_price(el.get_text())
+                        if p:
+                            price_new = p
+                            break
+
+            # Last resort: first price pattern in the whole card
+            if price_new is None:
+                m = _re.search(r'\b(\d{1,3}[.,]\d{2})\b', card_text)
+                if m:
+                    price_new = float(m.group(1).replace(",", "."))
+
+            if price_new is None:
+                continue
+
+            # Discount
+            discount = 0.0
+            disc_el = card.select_one("div.price-products-catalog-content__discount")
+            if disc_el:
+                dm = _re.search(r'(\d+)', disc_el.get_text())
+                if dm:
+                    discount = float(dm.group(1))
+            elif price_old and price_old > price_new:
+                discount = round((1 - price_new / price_old) * 100, 1)
+
+            products.append({
+                "name":      name,
+                "url":       url,
+                "volume_ml": vol,
+                "price_new": price_new,
+                "price_old": price_old,
+                "discount":  discount,
+            })
+        except Exception as e:
+            logger.debug(f"Beer card parse error: {e}")
+    return products, len(cards)
+
+
+async def _scrape_linella_beer(
+    session: aiohttp.ClientSession,
+    promo_url: str = _LINELLA_BEER_PROMO,
+) -> list[dict]:
     # Prime request to establish ci_session cookie
     try:
         async with session.get(
-            "https://linella.md/en/catalog/beer",
+            "https://linella.md/ru/catalog/pivo",
             headers=_BEER_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
@@ -1849,7 +1934,7 @@ async def _scrape_linella_beer(session: aiohttp.ClientSession) -> list[dict]:
 
     all_products: list[dict] = []
     for page in range(1, 20):
-        url = _LINELLA_BEER_PROMO if page == 1 else f"{_LINELLA_BEER_PROMO}&page={page}"
+        url = promo_url if page == 1 else f"{promo_url}&page={page}"
         try:
             async with session.get(
                 url, headers=_BEER_HEADERS,
@@ -1865,41 +1950,179 @@ async def _scrape_linella_beer(session: aiohttp.ClientSession) -> list[dict]:
 
         page_products, card_count = _parse_beer_page(html)
         if card_count == 0:
-            # No product cards at all — truly the last page
             break
         all_products.extend(page_products)
 
     return all_products
 
 
+_BEER_ZERO_PHRASES = [
+    "Привет, сладенький мой 🍺💕 Вот тебе список безалкогольного пивасика, чтобы ты оставался таким же свеженьким и готовым к новым приключениям. Никакого похмелья, только чистый вайб! 🏳️‍🌈",
+    "Ого, мой хороший активировал режим 0 😏 Безалкогольное пиво для тех, кто любит погорячее, но без последствий. Лови список, красотка! ✨🍻",
+    "Привет, мой пушистый топ 🐻💦 Специально для тебя — безалкогольный пивасик. Чтобы ты был бодреньким и мог всю ночь… дегустировать. Список ниже! 🏳️‍🌈",
+    "Сладенький, ты нажал 0? Как я и люблю — без лишнего градуса 😌 Лови свеженький список безалкогольного пива. Будем держать форму вместе! 🍑🍺",
+    "Йооо, мой любимый трезвенник 🔥 Вот тебе подборка безалкогольного пивасика. Чтобы ты оставался горячим, но не обжигал. Список готов, детка! 🏳️‍🌈✨",
+    "Привет, мой мягкий и нежный 🥰 Нажатие /beer 0 принято! Безалкогольное пиво для настоящих ценителей… лёгкого вкуса. Лови список, солнышко! 🍻💕",
+    "Ох, кто тут у нас без градуса сегодня? 😈 Привет, сладкий! Вот тебе список безалкогольного пивасика. Будешь пить и оставаться таким же соблазнительным. Список ниже! 🏳️‍🌈",
+    "Мой хороший, режим \"нулевой алкоголь\" активирован 💋 Лови безалкогольное пиво — для тех, кто любит всё лёгкое, воздушное и вкусное. Как ты 😉 Список готов!",
+    "Привеет, моя безалкогольная принцесса 👑🍺 Специально для тебя — список пивасика 0%. Чтобы ты мог пить сколько угодно и всё равно танцевать до утра. Го! 🏳️‍🌈",
+    "Сладенький, ты сегодня в настроении на лайт-версию? 😏 Безалкогольное пиво уже ждёт. Никакого тяжёлого утра, только приятный вкус и хорошее настроение. Лови список, мой хороший! ✨🍻💕",
+]
+
+_BEER_ZERO_KEYWORDS = ("0.0", "0,0", "безалк", "безалкогольное", "без алкогольное", "б/а", "non-alc", "non alc", "without alcohol", "alkoholfrei", "alcohol free", "0% ", "0%alc", "№0")
+
+
+def _is_nonalcoholic(name: str) -> bool:
+    n = name.lower()
+    return any(kw in n for kw in _BEER_ZERO_KEYWORDS)
+
+
 async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    show_all = bool(context.args and context.args[0].lower() == "all")
+    arg = (context.args[0].lower() if context.args else "")
+    show_all    = arg == "all"
+    show_zero   = arg == "0"
+    show_names  = arg == "names"
+    show_names0 = arg == "names0"
+
+    # Debug: scrape non-alcoholic category WITHOUT promo filter to see all 22+ items
+    if show_names0:
+        status_msg = await update.message.reply_text("🔍 Загружаю все безалкогольные пива...")
+        try:
+            _NO_PROMO = "https://linella.md/ru/catalog/pivo?ch%5B80%5D%5B%5D=574"
+
+            def _parse_all_names(html: str) -> tuple[list[dict], int]:
+                """Parse ALL products regardless of price/discount."""
+                soup = BeautifulSoup(html, "html.parser")
+                cards = soup.select("div.products-catalog-content__item")
+                items = []
+                for card in cards:
+                    name_el = card.select_one("a.products-catalog-content__name")
+                    if not name_el:
+                        continue
+                    name = name_el.get_text(strip=True)
+                    # Check for discount badge
+                    disc_el = card.select_one("div.price-products-catalog-content__discount")
+                    discount = 0.0
+                    if disc_el:
+                        dm = _re.search(r'(\d+)', disc_el.get_text())
+                        if dm:
+                            discount = float(dm.group(1))
+                    # Check out-of-stock
+                    oos = bool(card.select_one("div.products-catalog-content__not-available, .not-available"))
+                    items.append({"name": name, "discount": discount, "oos": oos})
+                return items, len(cards)
+
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get("https://linella.md/ru/catalog/pivo",
+                                           headers=_BEER_HEADERS,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        pass
+                except Exception:
+                    pass
+                all_raw: list[dict] = []
+                for page in range(1, 10):
+                    url = _NO_PROMO if page == 1 else f"{_NO_PROMO}&page={page}"
+                    async with session.get(url, headers=_BEER_HEADERS,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            break
+                        html = await resp.text()
+                    page_items, card_count = _parse_all_names(html)
+                    if card_count == 0:
+                        break
+                    all_raw.extend(page_items)
+            if not all_raw:
+                await status_msg.edit_text("😔 Ничего не найдено — возможно сайт заблокировал запрос.")
+                return
+            lines = [f"🍺 <b>Безалкогольное пиво — все ({len(all_raw)} шт.):</b>\n"]
+            for p in all_raw:
+                disc = f" 🔥-{p['discount']:.0f}%" if p.get("discount", 0) > 0 else ""
+                oos  = " ❌ нет в наличии" if p.get("oos") else ""
+                lines.append(f"• {p['name']}{disc}{oos}")
+            text = "\n".join(lines)
+            for chunk_start in range(0, len(text), 4000):
+                chunk = text[chunk_start:chunk_start + 4000]
+                if chunk_start == 0:
+                    await status_msg.edit_text(chunk, parse_mode="HTML")
+                else:
+                    await update.message.reply_html(chunk)
+        except Exception as e:
+            logger.error(f"beer names0 error: {e}")
+            await status_msg.edit_text(f"⚠️ Ошибка: {e}")
+        return
+
     status_msg = await update.message.reply_text("🍺 Ищу скидки на пиво в Linella...")
     try:
+        _ZERO_ALL_URL = "https://linella.md/ru/catalog/pivo?ch%5B80%5D%5B%5D=574"
+
         async with aiohttp.ClientSession() as session:
-            products = await _scrape_linella_beer(session)
+            if show_zero:
+                # Scrape ALL non-alcoholic beers (not just discounted)
+                try:
+                    async with session.get("https://linella.md/ru/catalog/pivo",
+                                           headers=_BEER_HEADERS,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        pass
+                except Exception:
+                    pass
+                products = []
+                for page in range(1, 10):
+                    url = _ZERO_ALL_URL if page == 1 else f"{_ZERO_ALL_URL}&page={page}"
+                    async with session.get(url, headers=_BEER_HEADERS,
+                                           timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            break
+                        html = await resp.text()
+                    page_items, card_count = _parse_beer_page_all(html)
+                    if card_count == 0:
+                        break
+                    products.extend(page_items)
+            else:
+                products = await _scrape_linella_beer(session, promo_url=_LINELLA_BEER_PROMO)
+
+        # Debug: dump all scraped names so we can check keywords
+        if show_names:
+            if not products:
+                await status_msg.edit_text("😔 Ничего не найдено.")
+                return
+            lines = [f"🍺 <b>Все названия ({len(products)} шт.):</b>\n"]
+            for p in products:
+                lines.append(f"• {p['name']}")
+            text = "\n".join(lines)
+            if len(text) > 4000:
+                text = text[:4000] + "\n…"
+            await status_msg.edit_text(text, parse_mode="HTML")
+            return
 
         if not products:
+            catalog_url = _ZERO_ALL_URL if show_zero else _LINELLA_BEER_PROMO
             await status_msg.edit_text(
-                "😔 Не удалось найти пиво со скидкой.\n\n"
-                f'🔗 Открой каталог вручную: <a href="{_LINELLA_BEER_PROMO}">Linella — акции на пиво</a>',
+                "😔 Не удалось найти пиво.\n\n"
+                f'🔗 Открой каталог вручную: <a href="{catalog_url}">Linella — пиво</a>',
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
             return
 
         products.sort(key=lambda p: p["price_new"])
-        display = products if show_all else products[:10]
+        display = products if (show_all or show_zero) else products[:10]
 
         from zoneinfo import ZoneInfo
         updated = datetime.now(ZoneInfo("Europe/Chisinau")).strftime("%d.%m.%Y %H:%M")
 
-        title = (
-            f"🍺 <b>Все акции на пиво (≤700ml) — {len(display)} шт.</b>"
-            if show_all else
-            "🍺 <b>Топ-10 пива со скидкой (≤700ml)</b>"
-        )
-        header = f"{title}\n<i>Linella · {updated} · {len(products)} акций найдено</i>\n"
+        if show_zero:
+            import random as _random
+            zero_phrase = _random.choice(_BEER_ZERO_PHRASES)
+            n_sale = sum(1 for p in display if p["discount"] > 0)
+            title = f"🍺 <b>Безалкогольное пиво — {len(display)} шт. ({n_sale} со скидкой)</b>"
+            header = f"{zero_phrase}\n\n{title}\n<i>Linella · {updated}</i>\n"
+        elif show_all:
+            title = f"🍺 <b>Все акции на пиво (≤700ml) — {len(display)} шт.</b>"
+            header = f"{title}\n<i>Linella · {updated} · {len(products)} акций найдено</i>\n"
+        else:
+            title = "🍺 <b>Топ-10 пива со скидкой (≤700ml)</b>"
+            header = f"{title}\n<i>Linella · {updated} · {len(products)} акций найдено</i>\n"
 
         medals = ["🥇", "🥈", "🥉"] + ["🍺"] * max(0, len(display) - 3)
         footer = "<i>Сортировка: от дешёвого · Цены актуальны на момент запроса</i>"
@@ -1908,14 +2131,18 @@ async def beer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         entry_lines = []
         for i, p in enumerate(display):
             vol = p["volume_ml"]
-            vol_str = f"{int(vol)}ml" if vol < 1000 else f"{vol / 1000:.2g}L"
+            vol_str = f"{int(vol)}мл" if vol < 1000 else f"{vol / 1000:.2g}л"
             name_link = f'<a href="{p["url"]}">{p["name"]}</a>'
-            entry_lines.append(
-                f"{medals[i]} {name_link} · {vol_str} · "
-                f"<b>{p['price_new']:.2f}</b> MDL "
-                f"(<s>{p['price_old']:.2f}</s>) "
-                f"🔥 -{p['discount']:.0f}%"
-            )
+            if show_zero and p["discount"] > 0 and p.get("price_old"):
+                price_str = (
+                    f"<b>{p['price_new']:.2f}</b> MDL "
+                    f"(<s>{p['price_old']:.2f}</s>) 🔥 -{p['discount']:.0f}%"
+                )
+            else:
+                price_str = f"<b>{p['price_new']:.2f}</b> MDL"
+                if show_zero and p["discount"] > 0:
+                    price_str += f" 🔥 -{p['discount']:.0f}%"
+            entry_lines.append(f"{medals[i]} {name_link} · {vol_str} · {price_str}")
 
         # Split into messages respecting Telegram's 4096-char limit
         LIMIT = 4000
