@@ -4,11 +4,20 @@
 
 ```
 moldova_bot/
-├── bot.py            ← Основной код бота
-├── requirements.txt  ← Зависимости Python
-├── .env.example      ← Шаблон переменных окружения
-├── Procfile          ← Для деплоя на Railway/Render
-└── README.md         ← Это руководство
+├── bot.py             ← Точка входа (запускает moldovabot.app.main)
+├── moldovabot/        ← Пакет бота
+│   ├── app.py         ← Сборка Application и регистрация хендлеров
+│   ├── config.py      ← Переменные окружения
+│   ├── data.py        ← Факты, анекдоты, викторина
+│   ├── timeutil.py    ← Часовой пояс Кишинёва
+│   ├── middleware.py  ← Логирование использования
+│   └── handlers/      ← Команды, сгруппированные по фиче
+│       (basic, weather, currency, fuel, crypto, news, joke,
+│        flights, cinema, ask, beer, digest, holiday, social)
+├── requirements.txt   ← Зависимости Python
+├── .env.example       ← Шаблон переменных окружения
+├── Procfile           ← Для деплоя на Railway/Render
+└── README.md          ← Это руководство
 ```
 
 ---
@@ -70,19 +79,28 @@ pip install -r requirements.txt
 
 ### Запуск
 ```bash
-# Вариант 1: через переменную окружения (рекомендуется)
+# Вариант 1: файл .env (рекомендуется для локального запуска)
+# Скопируй .env.example → .env и вставь токен
+cp .env.example .env
+
+python bot.py
+```
+
+Бот сам подхватит переменные из `.env` — вызов `load_dotenv()` уже встроен в
+`moldovabot/config.py`, ничего добавлять в код не нужно.
+
+```bash
+# Вариант 2: через переменную окружения (без файла .env)
 set BOT_TOKEN=1234567890:AAFxxx...   # Windows CMD
 $env:BOT_TOKEN="1234567890:AAFxxx..." # Windows PowerShell
 export BOT_TOKEN=1234567890:AAFxxx... # Mac/Linux
 
 python bot.py
-
-# Вариант 2: создай файл .env
-# Скопируй .env.example → .env и вставь токен
-# Затем в bot.py добавь в начале:
-# from dotenv import load_dotenv
-# load_dotenv()
 ```
+
+⚠️ Если переменная окружения задана и в `.env`, и в самой оболочке —
+`load_dotenv()` по умолчанию **не перезаписывает** уже существующие
+переменные окружения, так что оболочка побеждает.
 
 ### Добавление бота в группу
 1. Открой группу в Telegram
